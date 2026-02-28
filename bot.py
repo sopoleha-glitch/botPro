@@ -1,7 +1,5 @@
 import asyncio
 import logging
-import os
-import sys
 import json
 import hashlib
 import time
@@ -313,23 +311,40 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
         "temperature": 0.3
     }
     
+    start_time = time.time()
+    last_update_time = start_time
+    
     try:
+        if chat_id and message_id:
+            try:
+                bot = Bot.get_current()
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="🤔 Думаю... (это может занять до 10 секунд)"
+                )
+            except:
+                pass
+        
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=aiohttp.ClientTimeout(total=60)
+                timeout=aiohttp.ClientTimeout(total=25)
             ) as response:
                 response.raise_for_status()
                 
                 full_response = ""
                 buffer = ""
                 finish_reason = None
-                last_update = time.time()
-                thinking_shown = False
+                first_token_received = False
                 
                 async for line in response.content:
+                    if time.time() - start_time > 20:
+                        logger.warning("Превышено время ожидания ответа DeepSeek")
+                        break
+                    
                     line = line.decode('utf-8').strip()
                     if not line or not line.startswith("data: "):
                         continue
@@ -348,10 +363,22 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                         delta = choices[0]["delta"].get("content", "")
                         
                         if delta:
+                            if not first_token_received:
+                                first_token_received = True
+                                start_time = time.time()
+                                if chat_id and message_id:
+                                    try:
+                                        bot = Bot.get_current()
+                                        await bot.edit_message_text(
+                                            chat_id=chat_id,
+                                            message_id=message_id,
+                                            text="▌"
+                                        )
+                                    except:
+                                        pass
+                            
                             full_response += delta
                             buffer += delta
-                            last_update = time.time()
-                            thinking_shown = False
                             
                             if len(buffer) >= 30 and chat_id and message_id:
                                 try:
@@ -362,23 +389,36 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                                         text=full_response + "▌"
                                     )
                                     buffer = ""
+                                    last_update_time = time.time()
                                 except:
                                     pass
-                        
-                        elif time.time() - last_update > 2 and not thinking_shown and chat_id and message_id:
-                            try:
-                                bot = Bot.get_current()
-                                await bot.edit_message_text(
-                                    chat_id=chat_id,
-                                    message_id=message_id,
-                                    text=full_response + "\n\n🤔 (думаю...)"
-                                )
-                                thinking_shown = True
-                            except:
-                                pass
+                            
+                            if time.time() - last_update_time > 5:
+                                try:
+                                    bot = Bot.get_current()
+                                    await bot.edit_message_text(
+                                        chat_id=chat_id,
+                                        message_id=message_id,
+                                        text=full_response + "\n\n⏳ Генерация идёт долго, но я ещё работаю..."
+                                    )
+                                except:
+                                    pass
                                 
                     except json.JSONDecodeError:
                         continue
+                
+                if not first_token_received:
+                    if chat_id and message_id:
+                        try:
+                            bot = Bot.get_current()
+                            await bot.edit_message_text(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                text="😔 DeepSeek не отвечает. Попробуй позже."
+                            )
+                        except:
+                            pass
+                    return "😔 DeepSeek не отвечает. Попробуй позже."
                 
                 if chat_id and message_id:
                     final_text = full_response
@@ -397,6 +437,20 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 
                 return full_response
                 
+    except asyncio.TimeoutError:
+        logger.error("Таймаут при запросе к DeepSeek")
+        if chat_id and message_id:
+            try:
+                bot = Bot.get_current()
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="⏱️ Превышено время ожидания (25 сек). DeepSeek временно недоступен."
+                )
+            except:
+                pass
+        return "⏱️ Превышено время ожидания. DeepSeek временно недоступен."
+        
     except Exception as e:
         logger.error(f"DeepSeek stream error: {e}")
         if chat_id and message_id:
@@ -405,11 +459,11 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text="😔 Произошла ошибка"
+                    text="😔 Произошла ошибка при обращении к DeepSeek"
                 )
             except:
                 pass
-        return "😔 Произошла ошибка"
+        return "😔 Произошла ошибка при обращении к DeepSeek"
 
 async def send_schedule_to_user(bot: Bot, user_id: int):
     try:
@@ -592,6 +646,7 @@ VIP канал: {VIP_CHANNEL_URL}
         
         referrals = await TokenBotDB.get_referrals_count(user[0])
         
+        bot_username = (await message.bot.me()).username
         text = f"""💰 Твой кошелек
 
 💎 Баланс: {user[3]} токенов
@@ -600,7 +655,7 @@ VIP канал: {VIP_CHANNEL_URL}
 👥 Рефералов: {referrals}
 
 🔗 Твой код: {user[4]}
-📱 Ссылка: https://t.me/{(await message.bot.me()).username}?start={user[4]}
+📱 Ссылка: https://t.me/{bot_username}?start={user[4]}
 
 Приводи друзей и получай +5 токенов!"""
         
