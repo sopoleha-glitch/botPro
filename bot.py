@@ -1144,12 +1144,12 @@ VIP канал: {VIP_CHANNEL_URL}
         await TokenBotDB.save_chat_message(user_id, "assistant", response)
 
     @dp.message(F.text)
-    async def handle_text(message: types.Message):
+    async def handle_text(message: types.Message, state: FSMContext):
         user_id = message.from_user.id
         user = await TokenBotDB.get_user(user_id)
         
         if not user:
-            await cmd_start(message, None)
+            await cmd_start(message, state)
             return
         
         if user[10]:
@@ -1191,12 +1191,18 @@ VIP канал: {VIP_CHANNEL_URL}
                 tokens = (await cursor.fetchone())[0] or 0
             async with db.execute("SELECT COUNT(*) FROM schedule") as cursor:
                 schedule_count = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM payments WHERE status='pending'") as cursor:
+                pending_payments = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned=1") as cursor:
+                banned_users = (await cursor.fetchone())[0]
         
-        text = f"""📊 Админ панель
+        text = f"""📊 **АДМИН ПАНЕЛЬ**
 
 👥 Пользователи: {users}
 💰 Всего токенов: {tokens}
 📅 Задач в расписании: {schedule_count}
+⏳ Ожидают платежей: {pending_payments}
+🚫 Забанено: {banned_users}
 
 Обновлено: {datetime.now().strftime('%d/%m/%Y %H:%M')}"""
         
