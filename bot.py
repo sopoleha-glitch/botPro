@@ -318,7 +318,7 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text="⏳ Запрос к DeepSeek... (до 5 секунд)"
+                    text="⏳ Запрос к DeepSeek... (до 10 секунд)"
                 )
             except:
                 pass
@@ -328,15 +328,39 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 "https://api.deepseek.com/v1/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=aiohttp.ClientTimeout(total=5)
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as response:
                 response.raise_for_status()
                 
                 full_response = ""
+                first_token_received = False
+                keep_alive_count = 0
+                last_update_time = time.time()
                 
                 async for line in response.content:
                     line = line.decode('utf-8').strip()
-                    if not line or not line.startswith("data: "):
+                    
+                    if not line:
+                        continue
+                    
+                    if line.startswith(':'):
+                        keep_alive_count += 1
+                        if keep_alive_count >= 2 and not first_token_received:
+                            if time.time() - last_update_time > 3:
+                                if chat_id and message_id:
+                                    try:
+                                        bot = Bot.get_current()
+                                        await bot.edit_message_text(
+                                            chat_id=chat_id,
+                                            message_id=message_id,
+                                            text="⏳ DeepSeek перегружен, ожидание ответа... (keep-alive)"
+                                        )
+                                        last_update_time = time.time()
+                                    except:
+                                        pass
+                        continue
+                    
+                    if not line.startswith("data: "):
                         continue
                     
                     chunk = line[6:]
@@ -346,13 +370,54 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                     try:
                         obj = json.loads(chunk)
                         delta = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        
                         if delta:
+                            if not first_token_received:
+                                first_token_received = True
+                                if chat_id and message_id:
+                                    try:
+                                        bot = Bot.get_current()
+                                        await bot.edit_message_text(
+                                            chat_id=chat_id,
+                                            message_id=message_id,
+                                            text="▌"
+                                        )
+                                    except:
+                                        pass
+                            
                             full_response += delta
-                    except:
+                            
+                            if len(full_response) % 15 == 0 and chat_id and message_id:
+                                try:
+                                    bot = Bot.get_current()
+                                    await bot.edit_message_text(
+                                        chat_id=chat_id,
+                                        message_id=message_id,
+                                        text=full_response + "▌"
+                                    )
+                                except:
+                                    pass
+                                
+                    except json.JSONDecodeError:
                         continue
                 
-                if not full_response:
-                    full_response = "😔 DeepSeek не ответил. Попробуй позже."
+                if not first_token_received:
+                    if keep_alive_count > 3:
+                        error_msg = "😔 DeepSeek перегружен (keep-alive сигналы). Попробуй позже."
+                    else:
+                        error_msg = "😔 DeepSeek не ответил. Попробуй позже."
+                    
+                    if chat_id and message_id:
+                        try:
+                            bot = Bot.get_current()
+                            await bot.edit_message_text(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                text=error_msg
+                            )
+                        except:
+                            pass
+                    return error_msg
                 
                 if chat_id and message_id:
                     try:
@@ -375,11 +440,11 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text="⏱️ DeepSeek не отвечает (таймаут 5 сек). Попробуй позже."
+                    text="⏱️ DeepSeek не отвечает (таймаут 15 сек). Сервер перегружен."
                 )
             except:
                 pass
-        return "⏱️ DeepSeek не отвечает. Попробуй позже."
+        return "⏱️ DeepSeek не отвечает. Сервер перегружен."
         
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
