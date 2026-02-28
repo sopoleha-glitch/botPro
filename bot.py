@@ -311,9 +311,6 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
         "temperature": 0.3
     }
     
-    start_time = time.time()
-    last_update_time = start_time
-    
     try:
         if chat_id and message_id:
             try:
@@ -321,7 +318,7 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text="🤔 Думаю... (это может занять до 10 секунд)"
+                    text="⏳ Запрос к DeepSeek... (до 5 секунд)"
                 )
             except:
                 pass
@@ -331,20 +328,13 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 "https://api.deepseek.com/v1/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=aiohttp.ClientTimeout(total=25)
+                timeout=aiohttp.ClientTimeout(total=5)
             ) as response:
                 response.raise_for_status()
                 
                 full_response = ""
-                buffer = ""
-                finish_reason = None
-                first_token_received = False
                 
                 async for line in response.content:
-                    if time.time() - start_time > 20:
-                        logger.warning("Превышено время ожидания ответа DeepSeek")
-                        break
-                    
                     line = line.decode('utf-8').strip()
                     if not line or not line.startswith("data: "):
                         continue
@@ -355,82 +345,22 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                     
                     try:
                         obj = json.loads(chunk)
-                        choices = obj.get("choices", [{}])
-                        
-                        if choices and choices[0].get("finish_reason"):
-                            finish_reason = choices[0]["finish_reason"]
-                        
-                        delta = choices[0]["delta"].get("content", "")
-                        
+                        delta = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
                         if delta:
-                            if not first_token_received:
-                                first_token_received = True
-                                start_time = time.time()
-                                if chat_id and message_id:
-                                    try:
-                                        bot = Bot.get_current()
-                                        await bot.edit_message_text(
-                                            chat_id=chat_id,
-                                            message_id=message_id,
-                                            text="▌"
-                                        )
-                                    except:
-                                        pass
-                            
                             full_response += delta
-                            buffer += delta
-                            
-                            if len(buffer) >= 30 and chat_id and message_id:
-                                try:
-                                    bot = Bot.get_current()
-                                    await bot.edit_message_text(
-                                        chat_id=chat_id,
-                                        message_id=message_id,
-                                        text=full_response + "▌"
-                                    )
-                                    buffer = ""
-                                    last_update_time = time.time()
-                                except:
-                                    pass
-                            
-                            if time.time() - last_update_time > 5:
-                                try:
-                                    bot = Bot.get_current()
-                                    await bot.edit_message_text(
-                                        chat_id=chat_id,
-                                        message_id=message_id,
-                                        text=full_response + "\n\n⏳ Генерация идёт долго, но я ещё работаю..."
-                                    )
-                                except:
-                                    pass
-                                
-                    except json.JSONDecodeError:
+                    except:
                         continue
                 
-                if not first_token_received:
-                    if chat_id and message_id:
-                        try:
-                            bot = Bot.get_current()
-                            await bot.edit_message_text(
-                                chat_id=chat_id,
-                                message_id=message_id,
-                                text="😔 DeepSeek не отвечает. Попробуй позже."
-                            )
-                        except:
-                            pass
-                    return "😔 DeepSeek не отвечает. Попробуй позже."
+                if not full_response:
+                    full_response = "😔 DeepSeek не ответил. Попробуй позже."
                 
                 if chat_id and message_id:
-                    final_text = full_response
-                    if finish_reason == "length":
-                        final_text += "\n\n⚠️ Ответ обрезан из-за ограничения длины"
-                    
                     try:
                         bot = Bot.get_current()
                         await bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=message_id,
-                            text=final_text
+                            text=full_response
                         )
                     except:
                         pass
@@ -438,32 +368,32 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
                 return full_response
                 
     except asyncio.TimeoutError:
-        logger.error("Таймаут при запросе к DeepSeek")
+        logger.error("Таймаут DeepSeek")
         if chat_id and message_id:
             try:
                 bot = Bot.get_current()
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text="⏱️ Превышено время ожидания (25 сек). DeepSeek временно недоступен."
+                    text="⏱️ DeepSeek не отвечает (таймаут 5 сек). Попробуй позже."
                 )
             except:
                 pass
-        return "⏱️ Превышено время ожидания. DeepSeek временно недоступен."
+        return "⏱️ DeepSeek не отвечает. Попробуй позже."
         
     except Exception as e:
-        logger.error(f"DeepSeek stream error: {e}")
+        logger.error(f"DeepSeek error: {e}")
         if chat_id and message_id:
             try:
                 bot = Bot.get_current()
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text="😔 Произошла ошибка при обращении к DeepSeek"
+                    text="😔 Ошибка при обращении к DeepSeek"
                 )
             except:
                 pass
-        return "😔 Произошла ошибка при обращении к DeepSeek"
+        return "😔 Ошибка при обращении к DeepSeek"
 
 async def send_schedule_to_user(bot: Bot, user_id: int):
     try:
