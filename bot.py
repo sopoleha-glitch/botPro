@@ -291,7 +291,8 @@ def get_week_parity_russian():
     week_number = datetime.now().isocalendar()[1]
     return "Чётная" if week_number % 2 == 0 else "Нечётная"
 
-async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, message_id: int = None):
+async def ask_deepseek_simple(prompt: str, history=None):
+    """Простой запрос к DeepSeek без стриминга"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -307,158 +308,39 @@ async def ask_deepseek_stream(prompt: str, history=None, chat_id: int = None, me
         "model": "deepseek-chat",
         "messages": messages,
         "max_tokens": 2000,
-        "stream": True,
+        "stream": False,
         "temperature": 0.3
     }
     
     try:
-        if chat_id and message_id:
-            try:
-                bot = Bot.get_current()
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text="⏳ Запрос к DeepSeek... (до 10 секунд)"
-                )
-            except:
-                pass
-        
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 headers=headers,
                 json=data,
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
-                response.raise_for_status()
                 
-                full_response = ""
-                first_token_received = False
-                keep_alive_count = 0
-                last_update_time = time.time()
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"DeepSeek error {response.status}: {error_text}")
+                    return f"😔 Ошибка DeepSeek: {response.status}"
                 
-                async for line in response.content:
-                    line = line.decode('utf-8').strip()
-                    
-                    if not line:
-                        continue
-                    
-                    if line.startswith(':'):
-                        keep_alive_count += 1
-                        if keep_alive_count >= 2 and not first_token_received:
-                            if time.time() - last_update_time > 3:
-                                if chat_id and message_id:
-                                    try:
-                                        bot = Bot.get_current()
-                                        await bot.edit_message_text(
-                                            chat_id=chat_id,
-                                            message_id=message_id,
-                                            text="⏳ DeepSeek перегружен, ожидание ответа... (keep-alive)"
-                                        )
-                                        last_update_time = time.time()
-                                    except:
-                                        pass
-                        continue
-                    
-                    if not line.startswith("data: "):
-                        continue
-                    
-                    chunk = line[6:]
-                    if chunk == "[DONE]":
-                        break
-                    
-                    try:
-                        obj = json.loads(chunk)
-                        delta = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        
-                        if delta:
-                            if not first_token_received:
-                                first_token_received = True
-                                if chat_id and message_id:
-                                    try:
-                                        bot = Bot.get_current()
-                                        await bot.edit_message_text(
-                                            chat_id=chat_id,
-                                            message_id=message_id,
-                                            text="▌"
-                                        )
-                                    except:
-                                        pass
-                            
-                            full_response += delta
-                            
-                            if len(full_response) % 15 == 0 and chat_id and message_id:
-                                try:
-                                    bot = Bot.get_current()
-                                    await bot.edit_message_text(
-                                        chat_id=chat_id,
-                                        message_id=message_id,
-                                        text=full_response + "▌"
-                                    )
-                                except:
-                                    pass
-                                
-                    except json.JSONDecodeError:
-                        continue
+                result = await response.json()
+                full_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
                 
-                if not first_token_received:
-                    if keep_alive_count > 3:
-                        error_msg = "😔 DeepSeek перегружен (keep-alive сигналы). Попробуй позже."
-                    else:
-                        error_msg = "😔 DeepSeek не ответил. Попробуй позже."
-                    
-                    if chat_id and message_id:
-                        try:
-                            bot = Bot.get_current()
-                            await bot.edit_message_text(
-                                chat_id=chat_id,
-                                message_id=message_id,
-                                text=error_msg
-                            )
-                        except:
-                            pass
-                    return error_msg
-                
-                if chat_id and message_id:
-                    try:
-                        bot = Bot.get_current()
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            text=full_response
-                        )
-                    except:
-                        pass
+                if not full_response:
+                    full_response = "😔 DeepSeek не вернул ответ"
                 
                 return full_response
                 
     except asyncio.TimeoutError:
         logger.error("Таймаут DeepSeek")
-        if chat_id and message_id:
-            try:
-                bot = Bot.get_current()
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text="⏱️ DeepSeek не отвечает (таймаут 15 сек). Сервер перегружен."
-                )
-            except:
-                pass
-        return "⏱️ DeepSeek не отвечает. Сервер перегружен."
+        return "⏱️ DeepSeek не отвечает (таймаут 30 сек)"
         
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
-        if chat_id and message_id:
-            try:
-                bot = Bot.get_current()
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text="😔 Ошибка при обращении к DeepSeek"
-                )
-            except:
-                pass
-        return "😔 Ошибка при обращении к DeepSeek"
+        return f"😔 Ошибка: {str(e)[:50]}"
 
 async def send_schedule_to_user(bot: Bot, user_id: int):
     try:
@@ -753,7 +635,7 @@ VIP канал: {VIP_CHANNEL_URL}
 Язык: Python + aiogram 3.x
 
 Возможности:
-• Умные ответы через DeepSeek AI (⚡️ стриминг)
+• Умные ответы через DeepSeek AI
 • Чтение файлов (PDF, DOCX, TXT)
 • Память на 100 сообщений
 • Реферальная система (+5 токенов)
@@ -1125,14 +1007,17 @@ VIP канал: {VIP_CHANNEL_URL}
         
         history = await TokenBotDB.get_chat_history(user_id, 20)
         
-        sent_msg = await message.answer("▌")
+        # Показываем "печатает..."
+        await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
         
-        response = await ask_deepseek_stream(
+        # Получаем ответ
+        response = await ask_deepseek_simple(
             prompt=f"Содержимое файла:\n\n{text}\n\nОтветь на основе этого файла или просто проанализируй его.",
-            history=history,
-            chat_id=message.chat.id,
-            message_id=sent_msg.message_id
+            history=history
         )
+        
+        # Отправляем ответ
+        await message.answer(response)
         
         await TokenBotDB.update_tokens(user_id, -1)
         await TokenBotDB.save_chat_message(user_id, "user", f"[Файл: {file_name}]")
@@ -1160,14 +1045,17 @@ VIP канал: {VIP_CHANNEL_URL}
         
         history = await TokenBotDB.get_chat_history(user_id, 20)
         
-        sent_msg = await message.answer("▌")
+        # Показываем "печатает..."
+        await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
         
-        response = await ask_deepseek_stream(
+        # Получаем ответ
+        response = await ask_deepseek_simple(
             prompt=message.text,
-            history=history,
-            chat_id=message.chat.id,
-            message_id=sent_msg.message_id
+            history=history
         )
+        
+        # Отправляем ответ
+        await message.answer(response)
         
         await TokenBotDB.update_tokens(user_id, -1)
         await TokenBotDB.save_chat_message(user_id, "user", message.text)
