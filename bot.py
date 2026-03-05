@@ -7,6 +7,10 @@ import aiosqlite
 import aiohttp
 import PyPDF2
 import io
+import pytesseract
+from PIL import Image
+import pandas as pd
+from openpyxl import load_workbook
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
 from docx import Document
@@ -46,6 +50,13 @@ class ScheduleStates(StatesGroup):
 
 class ImageStates(StatesGroup):
     waiting_for_prompt = State()
+
+class EditStates(StatesGroup):
+    waiting_for_edit_text = State()
+    waiting_for_ai_prompt = State()
+    waiting_for_excel_cell = State()
+    waiting_for_excel_value = State()
+    waiting_for_edit_choice = State()
 
 class TokenBotDB:
     @staticmethod
@@ -264,7 +275,8 @@ def get_main_keyboard():
             keyboard=[
                 [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="💳 Купить")],
                 [KeyboardButton(text="👥 Рефералы"), KeyboardButton(text="📅 Расписание")],
-                [KeyboardButton(text="🎨 Нарисовать"), KeyboardButton(text="📚 Команды")],
+                [KeyboardButton(text="🎨 Нарисовать"), KeyboardButton(text="📸 OCR фото")],
+                [KeyboardButton(text="📄 Редактор файлов"), KeyboardButton(text="📚 Команды")],
                 [KeyboardButton(text="ℹ️ О боте"), KeyboardButton(text="🧹 Очистить")]
             ],
             resize_keyboard=True
@@ -285,6 +297,17 @@ def get_days_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=day, callback_data=f"add_day_{i}") for i, day in enumerate(days)],
         [InlineKeyboardButton(text="◀️ Отмена", callback_data="schedule")]
+    ])
+
+def get_file_edit_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Редактировать вручную", callback_data="edit_manual")],
+        [InlineKeyboardButton(text="🤖 AI-помощник", callback_data="edit_ai")],
+        [InlineKeyboardButton(text="➕ Добавить в конец", callback_data="edit_append")],
+        [InlineKeyboardButton(text="📊 Статистика файла", callback_data="edit_stats")],
+        [InlineKeyboardButton(text="📈 Excel: изменить ячейку", callback_data="edit_excel_cell")],
+        [InlineKeyboardButton(text="📊 Excel: сортировка", callback_data="edit_excel_sort")],
+        [InlineKeyboardButton(text="📝 Word: замена текста", callback_data="edit_word_replace")]
     ])
 
 def get_week_parity():
@@ -496,15 +519,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
 💰 Твой баланс: {user[3]} токенов
 📊 Всего заработано: {user[6]} токенов
 💬 Я помню последние 100 сообщений
-📁 Могу читать файлы (PDF, Word, TXT)
+📁 Могу читать файлы (PDF, Word, TXT, Excel)
+📸 Распознаю текст с фото (OCR)
+✏️ Редактирую файлы (TXT, DOCX, XLSX)
 📅 Можешь создать своё личное расписание
-🎨 Могу рисовать картинки (2 токена) через Pollinations
+🎨 Генерирую картинки (2 токена)
 
 VIP канал: {VIP_CHANNEL_URL}
 
 Как это работает:
 • 1 сообщение = 1 токен
 • 1 картинка = 2 токена
+• OCR фото = 2 токена
+• Редактирование = 1-2 токена
 • Загружай файлы - я прочитаю и отвечу
 • Приводи друзей (+5 токенов)
 • Покупай токены через Stars
@@ -520,14 +547,18 @@ VIP канал: {VIP_CHANNEL_URL}
 🎁 Бонус: 10 бесплатных токенов!
 🔗 Твой реферальный код: {ref_code}
 💬 Я помню последние 100 сообщений
-📁 Могу читать файлы (PDF, Word, TXT)
+📁 Могу читать файлы (PDF, Word, TXT, Excel)
+📸 Распознаю текст с фото (OCR)
+✏️ Редактирую файлы (TXT, DOCX, XLSX)
 📅 Можешь создать своё личное расписание
-🎨 Могу рисовать картинки (2 токена) через Pollinations
+🎨 Генерирую картинки (2 токена)
 
 Как это работает:
 • 10 токенов уже на твоем счету
 • 1 сообщение = 1 токен
 • 1 картинка = 2 токена
+• OCR фото = 2 токена
+• Редактирование = 1-2 токена
 • Загружай файлы - я прочитаю и отвечу
 • Приводи друзей (+5 токенов)
 • Управляй своим расписанием через 📅 Расписание
@@ -656,6 +687,438 @@ async def process_image_prompt(message: types.Message, state: FSMContext):
     
     await state.clear()
 
+@dp.message(F.text == "📸 OCR фото")
+async def ocr_button(message: types.Message):
+    await message.answer("📸 Отправь фото с текстом, я распознаю его (стоимость: 2 токена)")
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    user_id = message.from_user.id
+    user = await TokenBotDB.get_user(user_id)
+    
+    if not user or user[3] < 2:
+        await message.answer("❌ Недостаточно токенов! Нужно 2 токена")
+        return
+    
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    await message.answer("🔍 Распознаю текст с фото...")
+    
+    try:
+        file = await message.bot.get_file(message.photo[-1].file_id)
+        file_bytes = await file.download_as_bytearray()
+        image = Image.open(io.BytesIO(file_bytes))
+        text = pytesseract.image_to_string(image, lang='rus+eng')
+        
+        if text.strip():
+            await message.answer(f"📝 **Распознанный текст:**\n\n{text}")
+            await TokenBotDB.update_tokens(user_id, -2)
+        else:
+            await message.answer("😔 Не удалось распознать текст. Попробуй другое фото.")
+            
+    except Exception as e:
+        logger.error(f"OCR error: {e}")
+        await message.answer("😔 Ошибка при распознавании текста")
+
+@dp.message(F.text == "📄 Редактор файлов")
+async def editor_button(message: types.Message):
+    await message.answer(
+        "📄 **Редактор файлов**\n\n"
+        "Отправь мне файл (TXT, DOCX, XLSX), и я помогу:\n"
+        "• ✏️ Редактировать вручную\n"
+        "• 🤖 Исправить ошибки через AI\n"
+        "• 📊 Посмотреть статистику\n"
+        "• 📈 Работа с Excel (ячейки, сортировка)\n"
+        "• 📝 Работа с Word (замена текста)"
+    )
+
+@dp.message(F.document)
+async def handle_editable_document(message: types.Message, state: FSMContext):
+    file = message.document
+    file_name = file.file_name
+    file_ext = file_name.split('.')[-1].lower()
+    
+    allowed_exts = ['txt', 'docx', 'xlsx']
+    if file_ext not in allowed_exts:
+        await message.answer("❌ Поддерживаются только TXT, DOCX и XLSX файлы")
+        return
+    
+    user_id = message.from_user.id
+    user = await TokenBotDB.get_user(user_id)
+    if not user or user[3] < 1:
+        await message.answer("❌ Недостаточно токенов! Нужен 1 токен")
+        return
+    
+    await message.answer("📥 Скачиваю файл...")
+    
+    file_obj = await message.bot.get_file(file.file_id)
+    file_bytes = await file_obj.download_as_bytearray()
+    
+    file_info = {
+        'filename': file_name,
+        'extension': file_ext,
+        'content': file_bytes,
+        'size': len(file_bytes)
+    }
+    
+    await state.update_data(current_file=file_info)
+    
+    await message.answer(
+        f"✅ Файл '{file_name}' загружен ({file_size(len(file_bytes))})",
+        reply_markup=get_file_edit_keyboard()
+    )
+
+def file_size(size_bytes):
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+@dp.callback_query(F.data == "edit_stats")
+async def edit_stats(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info:
+        await callback.answer("Файл не найден")
+        return
+    
+    ext = file_info['extension']
+    content = file_info['content']
+    
+    if ext == 'txt':
+        text = content.decode('utf-8', errors='ignore')
+        lines = len(text.split('\n'))
+        words = len(text.split())
+        chars = len(text)
+        
+        stats = f"""📊 **Статистика файла**
+
+📄 Имя: {file_info['filename']}
+📦 Размер: {file_size(file_info['size'])}
+📝 Строк: {lines}
+🔤 Слов: {words}
+📏 Символов: {chars}"""
+        
+    elif ext == 'docx':
+        doc = Document(io.BytesIO(content))
+        paragraphs = len(doc.paragraphs)
+        text = '\n'.join([p.text for p in doc.paragraphs])
+        words = len(text.split())
+        
+        stats = f"""📊 **Статистика Word-документа**
+
+📄 Имя: {file_info['filename']}
+📦 Размер: {file_size(file_info['size'])}
+📝 Параграфов: {paragraphs}
+🔤 Слов: {words}"""
+        
+    elif ext == 'xlsx':
+        df = pd.read_excel(io.BytesIO(content))
+        rows, cols = df.shape
+        
+        stats = f"""📊 **Статистика Excel-файла**
+
+📄 Имя: {file_info['filename']}
+📦 Размер: {file_size(file_info['size'])}
+📊 Листов: 1
+📏 Строк: {rows}
+📐 Столбцов: {cols}
+🔢 Ячеек: {rows * cols}"""
+    
+    await callback.message.edit_text(stats)
+    await callback.answer()
+
+@dp.callback_query(F.data == "edit_manual")
+async def edit_manual_start(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info:
+        await callback.answer("Файл не найден")
+        return
+    
+    ext = file_info['extension']
+    
+    if ext == 'txt':
+        content = file_info['content'].decode('utf-8', errors='ignore')
+        await callback.message.edit_text(
+            f"📄 **Текущее содержимое:**\n\n{content[:500]}...\n\n"
+            "✏️ Отправь новый текст для файла"
+        )
+        await state.set_state(EditStates.waiting_for_edit_text)
+        
+    elif ext == 'docx':
+        doc = Document(io.BytesIO(file_info['content']))
+        text = '\n'.join([p.text for p in doc.paragraphs])
+        await callback.message.edit_text(
+            f"📄 **Текст из документа:**\n\n{text[:500]}...\n\n"
+            "✏️ Отправь новый текст для документа"
+        )
+        await state.set_state(EditStates.waiting_for_edit_text)
+        
+    elif ext == 'xlsx':
+        df = pd.read_excel(io.BytesIO(file_info['content']))
+        await callback.message.edit_text(
+            f"📊 **Excel-файл**\n\n"
+            f"{df.head(10).to_string()}\n\n"
+            "Для редактирования Excel используй кнопку 'Excel: изменить ячейку'"
+        )
+    
+    await callback.answer()
+
+@dp.message(EditStates.waiting_for_edit_text)
+async def edit_manual_process(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info:
+        await message.answer("❌ Файл не найден. Начни заново.")
+        await state.clear()
+        return
+    
+    ext = file_info['extension']
+    new_content = message.text
+    
+    if ext == 'txt':
+        file_bytes = new_content.encode('utf-8')
+        new_filename = f"edited_{file_info['filename']}"
+        
+    elif ext == 'docx':
+        doc = Document()
+        for line in new_content.split('\n'):
+            doc.add_paragraph(line)
+        file_bytes = io.BytesIO()
+        doc.save(file_bytes)
+        file_bytes = file_bytes.getvalue()
+        new_filename = f"edited_{file_info['filename']}"
+    
+    await message.answer_document(
+        document=BufferedInputFile(file_bytes, filename=new_filename),
+        caption="✅ Вот твой отредактированный файл!"
+    )
+    
+    await TokenBotDB.update_tokens(message.from_user.id, -1)
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_ai")
+async def edit_ai_start(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info:
+        await callback.answer("Файл не найден")
+        return
+    
+    ext = file_info['extension']
+    
+    if ext == 'txt':
+        content = file_info['content'].decode('utf-8', errors='ignore')
+    elif ext == 'docx':
+        doc = Document(io.BytesIO(file_info['content']))
+        content = '\n'.join([p.text for p in doc.paragraphs])
+    else:
+        await callback.message.edit_text("❌ AI-редактирование пока только для TXT и DOCX")
+        return
+    
+    await state.update_data(edit_content=content, edit_ext=ext)
+    
+    await callback.message.edit_text(
+        "🤖 **AI-редактор**\n\n"
+        "Напиши, что нужно сделать с файлом. Например:\n"
+        "• 'исправь орфографические ошибки'\n"
+        "• 'перепиши в официальном стиле'\n"
+        "• 'сделай текст короче'\n"
+        "• 'добавь пункты про Python'"
+    )
+    await state.set_state(EditStates.waiting_for_ai_prompt)
+
+@dp.message(EditStates.waiting_for_ai_prompt)
+async def edit_ai_process(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    content = data.get('edit_content', '')
+    ext = data.get('edit_ext', 'txt')
+    prompt = message.text
+    
+    await message.answer("🤔 Думаю...")
+    
+    ai_prompt = f"""У меня есть файл с содержимым:
+    
+{content[:2000]}
+
+Задача: {prompt}
+
+Верни ТОЛЬКО исправленное содержимое файла, без пояснений."""
+    
+    response = await ask_deepseek_simple(ai_prompt)
+    
+    if response and "😔" not in response:
+        if ext == 'txt':
+            file_bytes = response.encode('utf-8')
+            await message.answer_document(
+                document=BufferedInputFile(file_bytes, filename="ai_edited.txt"),
+                caption="✅ Отредактировано с помощью AI!"
+            )
+        elif ext == 'docx':
+            doc = Document()
+            for line in response.split('\n'):
+                doc.add_paragraph(line)
+            file_bytes = io.BytesIO()
+            doc.save(file_bytes)
+            await message.answer_document(
+                document=BufferedInputFile(file_bytes.getvalue(), filename="ai_edited.docx"),
+                caption="✅ Отредактировано с помощью AI!"
+            )
+        
+        await TokenBotDB.update_tokens(message.from_user.id, -2)
+    else:
+        await message.answer("😔 Не удалось обработать запрос")
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_excel_cell")
+async def edit_excel_cell_start(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info or file_info['extension'] != 'xlsx':
+        await callback.answer("Это не Excel-файл")
+        return
+    
+    df = pd.read_excel(io.BytesIO(file_info['content']))
+    await state.update_data(excel_df=df)
+    
+    await callback.message.edit_text(
+        "📈 **Excel: изменение ячейки**\n\n"
+        f"{df.head(10).to_string()}\n\n"
+        "Введи номер строки и столбца для изменения (например: '1 2' для строки 1, столбца 2)"
+    )
+    await state.set_state(EditStates.waiting_for_excel_cell)
+
+@dp.message(EditStates.waiting_for_excel_cell)
+async def edit_excel_cell_process(message: types.Message, state: FSMContext):
+    try:
+        row, col = map(int, message.text.split())
+        data = await state.get_data()
+        df = data.get('excel_df')
+        
+        await state.update_data(edit_row=row, edit_col=col)
+        await message.answer(f"Введи новое значение для ячейки [{row}, {col}]")
+        await state.set_state(EditStates.waiting_for_excel_value)
+    except:
+        await message.answer("❌ Неверный формат. Используй: 'строка столбец' (например: 1 2)")
+
+@dp.message(EditStates.waiting_for_excel_value)
+async def edit_excel_value_process(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    df = data.get('excel_df')
+    row = data.get('edit_row')
+    col = data.get('edit_col')
+    value = message.text
+    
+    try:
+        df.iat[row-1, col-1] = value
+        
+        output = io.BytesIO()
+        df.to_excel(output, index=False)
+        output.seek(0)
+        
+        await message.answer_document(
+            document=BufferedInputFile(output.read(), filename="edited.xlsx"),
+            caption="✅ Файл обновлён!"
+        )
+        
+        await TokenBotDB.update_tokens(message.from_user.id, -1)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_excel_sort")
+async def edit_excel_sort(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info or file_info['extension'] != 'xlsx':
+        await callback.answer("Это не Excel-файл")
+        return
+    
+    df = pd.read_excel(io.BytesIO(file_info['content']))
+    df_sorted = df.sort_values(by=df.columns[0])
+    
+    output = io.BytesIO()
+    df_sorted.to_excel(output, index=False)
+    output.seek(0)
+    
+    await callback.message.answer_document(
+        document=BufferedInputFile(output.read(), filename="sorted.xlsx"),
+        caption="✅ Файл отсортирован по первому столбцу"
+    )
+    await TokenBotDB.update_tokens(callback.from_user.id, -1)
+    await callback.answer()
+
+@dp.callback_query(F.data == "edit_word_replace")
+async def edit_word_replace_start(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info or file_info['extension'] != 'docx':
+        await callback.answer("Это не Word-файл")
+        return
+    
+    doc = Document(io.BytesIO(file_info['content']))
+    text = '\n'.join([p.text for p in doc.paragraphs])
+    
+    await state.update_data(word_doc=doc, word_text=text)
+    await callback.message.edit_text(
+        "📝 **Word: замена текста**\n\n"
+        f"Текущий текст:\n{text[:500]}...\n\n"
+        "Введи что заменить и на что в формате: 'старое|новое'"
+    )
+    await state.set_state(EditStates.waiting_for_word_replace)
+
+@dp.message(EditStates.waiting_for_word_replace)
+async def edit_word_replace_process(message: types.Message, state: FSMContext):
+    try:
+        old, new = message.text.split('|')
+        data = await state.get_data()
+        doc = data.get('word_doc')
+        
+        for paragraph in doc.paragraphs:
+            if old in paragraph.text:
+                paragraph.text = paragraph.text.replace(old, new)
+        
+        output = io.BytesIO()
+        doc.save(output)
+        output.seek(0)
+        
+        await message.answer_document(
+            document=BufferedInputFile(output.read(), filename="replaced.docx"),
+            caption="✅ Замена выполнена!"
+        )
+        
+        await TokenBotDB.update_tokens(message.from_user.id, -1)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "edit_append")
+async def edit_append(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_info = data.get('current_file')
+    
+    if not file_info:
+        await callback.answer("Файл не найден")
+        return
+    
+    await callback.message.edit_text(
+        "➕ Отправь текст, который нужно добавить в конец файла"
+    )
+    await state.set_state(EditStates.waiting_for_edit_text)
+    await state.update_data(append_mode=True)
+
 @dp.message(F.text == "📚 Команды")
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -672,14 +1135,17 @@ async def cmd_help(message: types.Message):
 🎨 Генерация картинок:
 /draw - Нарисовать картинку (2 токена)
 
+📸 Распознавание текста:
+(просто отправь фото с текстом) - 2 токена
+
+📄 Редактирование файлов:
+(отправь TXT, DOCX или XLSX файл)
+
 📅 Твоё личное расписание:
 /schedule - Управление расписанием
 • 14 дней бесплатно
 • Потом 1 токен/день
 • Чётные/нечётные недели
-
-📁 Файлы:
-(просто отправь PDF, DOCX или TXT файл)
 
 👥 Реферальная система:
 /referral - Твоя реферальная ссылка
@@ -696,12 +1162,14 @@ async def cmd_about(message: types.Message):
     text = f"""🤖 О боте
 
 Название: TokenBot
-Версия: 8.0 (с генерацией картинок)
+Версия: 9.0 (OCR + Редактор файлов)
 Язык: Python + aiogram 3.x
 
 Возможности:
 • Умные ответы через DeepSeek AI
-• Генерация картинок через Pollinations (2 токена)
+• Генерация картинок (2 токена)
+• 📸 OCR — распознавание текста с фото (2 токена)
+• 📄 Редактирование TXT, DOCX, XLSX файлов (1-2 токена)
 • Чтение файлов (PDF, DOCX, TXT)
 • Память на 100 сообщений
 • Реферальная система (+5 токенов)
@@ -713,6 +1181,7 @@ async def cmd_about(message: types.Message):
 Статистика:
 • 1 сообщение = 1 токен
 • 1 картинка = 2 токена
+• OCR фото = 2 токена
 • Приведи друга = +5 токенов
 
 VIP канал: {VIP_CHANNEL_URL}
@@ -1026,101 +1495,6 @@ async def successful_payment_handler(message: types.Message):
         reply_markup=get_main_keyboard()
     )
 
-@dp.message(F.document)
-async def handle_document(message: types.Message):
-    user_id = message.from_user.id
-    user = await TokenBotDB.get_user(user_id)
-    
-    if not user:
-        await message.answer("Сначала зарегистрируйся через /start")
-        return
-    
-    if user[10]:
-        await message.answer("Ты забанен!")
-        return
-    
-    if user[3] < 1:
-        await message.answer("❌ Недостаточно токенов! Купи через /buy")
-        return
-    
-    await message.answer("📥 Получаю файл, подожди...")
-    
-    file = await message.bot.get_file(message.document.file_id)
-    file_path = file.file_path
-    file_name = message.document.file_name
-    file_ext = file_name.split('.')[-1].lower()
-    
-    file_content = await message.bot.download_file(file_path)
-    file_bytes = file_content.read()
-    
-    text = ""
-    
-    if file_ext == 'pdf':
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    elif file_ext == 'docx':
-        doc = Document(io.BytesIO(file_bytes))
-        text = '\n'.join([para.text for para in doc.paragraphs])
-    elif file_ext == 'txt':
-        text = file_bytes.decode('utf-8')
-    else:
-        await message.answer("Поддерживаются только PDF, DOCX и TXT файлы")
-        return
-    
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    
-    history = await TokenBotDB.get_chat_history(user_id, 20)
-    
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
-    response = await ask_deepseek_simple(
-        prompt=f"Содержимое файла:\n\n{text}\n\nОтветь на основе этого файла или просто проанализируй его.",
-        history=history
-    )
-    
-    await message.answer(response)
-    
-    await TokenBotDB.update_tokens(user_id, -1)
-    await TokenBotDB.save_chat_message(user_id, "user", f"[Файл: {file_name}]")
-    await TokenBotDB.save_chat_message(user_id, "assistant", response)
-
-@dp.message(F.text)
-async def handle_text(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    user = await TokenBotDB.get_user(user_id)
-    
-    if not user:
-        await cmd_start(message, state)
-        return
-    
-    if user[10]:
-        await message.answer("Ты забанен!")
-        return
-    
-    if message.text.startswith('/'):
-        return
-    
-    if user[3] < 1:
-        await message.answer("❌ Недостаточно токенов! Купи через /buy")
-        return
-    
-    history = await TokenBotDB.get_chat_history(user_id, 20)
-    
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
-    response = await ask_deepseek_simple(
-        prompt=message.text,
-        history=history
-    )
-    
-    await message.answer(response)
-    
-    await TokenBotDB.update_tokens(user_id, -1)
-    await TokenBotDB.save_chat_message(user_id, "user", message.text)
-    await TokenBotDB.save_chat_message(user_id, "assistant", response)
-
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1154,7 +1528,7 @@ async def cmd_admin(message: types.Message):
 async def main():
     await TokenBotDB.init_db()
     asyncio.create_task(schedule_checker(bot))
-    logger.info("Бот запущен с генерацией картинок!")
+    logger.info("Бот запущен с OCR и редактированием файлов!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
