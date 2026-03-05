@@ -57,6 +57,7 @@ class EditStates(StatesGroup):
     waiting_for_excel_cell = State()
     waiting_for_excel_value = State()
     waiting_for_edit_choice = State()
+    waiting_for_word_replace = State()
 
 class TokenBotDB:
     @staticmethod
@@ -277,7 +278,7 @@ def get_main_keyboard():
                 [KeyboardButton(text="👥 Рефералы"), KeyboardButton(text="📅 Расписание")],
                 [KeyboardButton(text="🎨 Нарисовать"), KeyboardButton(text="📸 OCR фото")],
                 [KeyboardButton(text="📄 Редактор файлов"), KeyboardButton(text="📚 Команды")],
-                [KeyboardButton(text="ℹ️ О боте"), KeyboardButton(text="🧹 Очистить")]
+                [KeyboardButton(text="🧹 Очистить")]
             ],
             resize_keyboard=True
         )
@@ -1153,40 +1154,6 @@ async def cmd_help(message: types.Message):
 VIP канал: {VIP_CHANNEL_URL}
 
 👇 Используй кнопки внизу!"""
-    
-    await message.answer(text, reply_markup=get_main_keyboard())
-
-@dp.message(F.text == "ℹ️ О боте")
-@dp.message(Command("about"))
-async def cmd_about(message: types.Message):
-    text = f"""🤖 О боте
-
-Название: TokenBot
-Версия: 9.0 (OCR + Редактор файлов)
-Язык: Python + aiogram 3.x
-
-Возможности:
-• Умные ответы через DeepSeek AI
-• Генерация картинок (2 токена)
-• 📸 OCR — распознавание текста с фото (2 токена)
-• 📄 Редактирование TXT, DOCX, XLSX файлов (1-2 токена)
-• Чтение файлов (PDF, DOCX, TXT)
-• Память на 100 сообщений
-• Реферальная система (+5 токенов)
-• Индивидуальное расписание для каждого
-• Чётные/нечётные недели
-• 14 дней бесплатно, потом 1 токен/день
-• Оплата через Telegram Stars
-
-Статистика:
-• 1 сообщение = 1 токен
-• 1 картинка = 2 токена
-• OCR фото = 2 токена
-• Приведи друга = +5 токенов
-
-VIP канал: {VIP_CHANNEL_URL}
-
-Приятного использования! 🚀"""
     
     await message.answer(text, reply_markup=get_main_keyboard())
 
