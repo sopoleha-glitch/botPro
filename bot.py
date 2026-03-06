@@ -12,7 +12,7 @@ from PIL import Image
 import pandas as pd
 from openpyxl import load_workbook
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable, Dict, Optional
 from docx import Document
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types, F
@@ -29,6 +29,9 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import StateFilter
+from functools import lru_cache, wraps
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 BOT_TOKEN = "8667653728:AAF3Ekms8refE2-BvS1tgDl03sVuLpvvpx0"
 ADMIN_ID = 745613614
@@ -42,6 +45,113 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DB_PATH = 'tokenbot.db'
+executor = ThreadPoolExecutor(max_workers=4)
+
+class DatabaseManager:
+    _instance = None
+    _connection = None
+    _lock = asyncio.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    async def get_connection(self):
+        if self._connection is None:
+            self._connection = await aiosqlite.connect(DB_PATH)
+            # Оптимизация SQLite
+            await self._connection.execute("PRAGMA journal_mode=WAL")
+            await self._connection.execute("PRAGMA synchronous=NORMAL")
+            await self._connection.execute("PRAGMA cache_size=10000")
+            await self._connection.execute("PRAGMA temp_store=MEMORY")
+            await self._connection.execute("PRAGMA mmap_size=30000000000")
+        return self._connection
+    
+    async def close(self):
+        if self._connection:
+            await self._connection.close()
+            self._connection = None
+    
+    async def execute(self, query: str, params: tuple = ()):
+        async with self._lock:
+            conn = await self.get_connection()
+            try:
+                async with conn.execute(query, params) as cursor:
+                    await conn.commit()
+                    return cursor
+            except Exception as e:
+                logger.error(f"Database error: {e}")
+                raise
+    
+    async def fetchone(self, query: str, params: tuple = ()):
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.execute(query, params) as cursor:
+                return await cursor.fetchone()
+    
+    async def fetchall(self, query: str, params: tuple = ()):
+        async with self._lock:
+            conn = await self.get_connection()
+            async with conn.execute(query, params) as cursor:
+                return await cursor.fetchall()
+    
+    async def executemany(self, query: str, params: list):
+        async with self._lock:
+            conn = await self.get_connection()
+            await conn.executemany(query, params)
+            await conn.commit()
+
+db_manager = DatabaseManager()
+
+class CacheManager:
+    def __init__(self, ttl: int = 60):
+        self.cache = {}
+        self.ttl = ttl
+        self._cleanup_task = None
+    
+    async def start_cleanup(self):
+        async def cleanup():
+            while True:
+                await asyncio.sleep(300) 
+                now = time.time()
+                self.cache = {k: v for k, v in self.cache.items() 
+                            if now - v[1] < self.ttl}
+        self._cleanup_task = asyncio.create_task(cleanup())
+    
+    async def get(self, key: str):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            del self.cache[key]
+        return None
+    
+    async def set(self, key: str, value: Any):
+        self.cache[key] = (value, time.time())
+    
+    async def delete(self, key: str):
+        self.cache.pop(key, None)
+    
+    async def clear(self):
+        self.cache.clear()
+
+cache = CacheManager(ttl=300)
+
+def timing_decorator(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start = time.time()
+        result = await func(*args, **kwargs)
+        duration = time.time() - start
+        if duration > 1:
+            logger.warning(f"Slow operation {func.__name__}: {duration:.2f}s")
+        return result
+    return wrapper
+
+async def run_in_executor(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, func, *args)
 
 class ScheduleStates(StatesGroup):
     waiting_for_day = State()
@@ -60,212 +170,292 @@ class EditStates(StatesGroup):
     waiting_for_word_replace = State()
 
 class TokenBotDB:
+    
     @staticmethod
     async def init_db():
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    tokens INTEGER DEFAULT 10,
-                    referral_code TEXT UNIQUE,
-                    referred_by INTEGER,
-                    total_earned INTEGER DEFAULT 10,
-                    total_spent INTEGER DEFAULT 0,
-                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_banned INTEGER DEFAULT 0
-                )
-            ''')
-            
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS chat_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    role TEXT,
-                    content TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS schedule (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    time TEXT,
-                    day_of_week INTEGER,
-                    task TEXT,
-                    week_parity TEXT DEFAULT 'все',
-                    enabled INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS schedule_access (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER UNIQUE,
-                    start_date TEXT,
-                    active INTEGER DEFAULT 1
-                )
-            ''')
-            
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS payments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    amount REAL,
-                    tokens INTEGER,
-                    status TEXT DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    verified_at TIMESTAMP
-                )
-            ''')
-            
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS referrals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    referrer_id INTEGER,
-                    referred_id INTEGER,
-                    bonus_tokens INTEGER DEFAULT 5,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_schedule_main ON schedule(user_id, day_of_week, enabled)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
-            
-            await db.commit()
-        logger.info("База данных инициализирована")
+        await db_manager.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                tokens INTEGER DEFAULT 10,
+                referral_code TEXT UNIQUE,
+                referred_by INTEGER,
+                total_earned INTEGER DEFAULT 10,
+                total_spent INTEGER DEFAULT 0,
+                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_banned INTEGER DEFAULT 0
+            )
+        ''')
+        
+        await db_manager.execute('''
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                role TEXT,
+                content TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        await db_manager.execute('''
+            CREATE TABLE IF NOT EXISTS schedule (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                time TEXT,
+                day_of_week INTEGER,
+                task TEXT,
+                week_parity TEXT DEFAULT 'все',
+                enabled INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        await db_manager.execute('''
+            CREATE TABLE IF NOT EXISTS schedule_access (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                start_date TEXT,
+                active INTEGER DEFAULT 1
+            )
+        ''')
+        
+        await db_manager.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                tokens INTEGER,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                verified_at TIMESTAMP
+            )
+        ''')
+        
+        await db_manager.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER,
+                referred_id INTEGER,
+                bonus_tokens INTEGER DEFAULT 5,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        await db_manager.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id)")
+        await db_manager.execute("CREATE INDEX IF NOT EXISTS idx_schedule_user ON schedule(user_id)")
+        await db_manager.execute("CREATE INDEX IF NOT EXISTS idx_schedule_day ON schedule(day_of_week, enabled)")
+        await db_manager.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
+        await db_manager.execute("CREATE INDEX IF NOT EXISTS idx_users_tokens ON users(tokens)")
+        await db_manager.execute("CREATE INDEX IF NOT EXISTS idx_users_referral ON users(referral_code)")
+        
+        logger.info("Database initialized with optimizations")
 
     @staticmethod
+    @timing_decorator
     async def get_user(user_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                return await cursor.fetchone()
+        cache_key = f"user_{user_id}"
+        cached = await cache.get(cache_key)
+        if cached:
+            return cached
+        
+        result = await db_manager.fetchone(
+            "SELECT * FROM users WHERE user_id = ?", 
+            (user_id,)
+        )
+        
+        if result:
+            await cache.set(cache_key, result)
+        return result
 
     @staticmethod
+    @timing_decorator
     async def create_user(user_id: int, username: str, first_name: str, referred_by: int = None):
         referral_code = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:8].upper()
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
+        
+        conn = await db_manager.get_connection()
+        async with conn.execute("BEGIN TRANSACTION"):
+            await db_manager.execute(
                 "INSERT OR REPLACE INTO users (user_id, username, first_name, referral_code, referred_by) VALUES (?, ?, ?, ?, ?)",
                 (user_id, username or "", first_name or "User", referral_code, referred_by)
             )
             if referred_by:
-                await db.execute("UPDATE users SET tokens = tokens + 5 WHERE user_id = ?", (referred_by,))
-            await db.commit()
+                await db_manager.execute(
+                    "UPDATE users SET tokens = tokens + 5 WHERE user_id = ?", 
+                    (referred_by,)
+                )
+                await db_manager.execute(
+                    "INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)",
+                    (referred_by, user_id)
+                )
+        
+        await cache.delete(f"user_{user_id}")
+        if referred_by:
+            await cache.delete(f"user_{referred_by}")
+            await cache.delete(f"referrals_{referred_by}")
+        
         return referral_code
 
     @staticmethod
+    @timing_decorator
     async def update_tokens(user_id: int, tokens: int):
-        async with aiosqlite.connect(DB_PATH) as db:
+        conn = await db_manager.get_connection()
+        async with conn.execute("BEGIN TRANSACTION"):
             if tokens > 0:
-                await db.execute("UPDATE users SET tokens = tokens + ?, total_earned = total_earned + ? WHERE user_id = ?", 
-                               (tokens, tokens, user_id))
+                await db_manager.execute(
+                    "UPDATE users SET tokens = tokens + ?, total_earned = total_earned + ?, last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", 
+                    (tokens, tokens, user_id)
+                )
             else:
-                await db.execute("UPDATE users SET tokens = tokens + ?, total_spent = total_spent + ? WHERE user_id = ?", 
-                               (tokens, abs(tokens), user_id))
-            await db.commit()
+                await db_manager.execute(
+                    "UPDATE users SET tokens = tokens + ?, total_spent = total_spent + ?, last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", 
+                    (tokens, abs(tokens), user_id)
+                )
+        
+        # Инвалидируем кэш
+        await cache.delete(f"user_{user_id}")
 
     @staticmethod
+    @timing_decorator
     async def get_chat_history(user_id: int, limit: int = 20):
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY timestamp ASC LIMIT ?",
-                (user_id, limit)
-            ) as cursor:
-                return await cursor.fetchall()
+        return await db_manager.fetchall(
+            "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY timestamp ASC LIMIT ?",
+            (user_id, limit)
+        )
 
     @staticmethod
+    @timing_decorator
     async def save_chat_message(user_id: int, role: str, content: str):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)",
-                (user_id, role, content)
+        await db_manager.execute(
+            "INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)",
+            (user_id, role, content)
+        )
+        
+        await db_manager.execute('''
+            DELETE FROM chat_history 
+            WHERE id IN (
+                SELECT id FROM chat_history 
+                WHERE user_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT -1 OFFSET 100
             )
-            await db.commit()
+        ''', (user_id,))
 
     @staticmethod
     async def get_user_by_referral(code: str):
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT user_id FROM users WHERE referral_code = ?", (code,)) as cursor:
-                return await cursor.fetchone()
+        return await db_manager.fetchone(
+            "SELECT user_id FROM users WHERE referral_code = ?", 
+            (code,)
+        )
 
     @staticmethod
     async def get_referrals_count(user_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,)) as cursor:
-                result = await cursor.fetchone()
-                return result[0] if result else 0
+        cache_key = f"referrals_{user_id}"
+        cached = await cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        result = await db_manager.fetchone(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", 
+            (user_id,)
+        )
+        count = result[0] if result else 0
+        await cache.set(cache_key, count)
+        return count
 
     @staticmethod
     async def get_schedule_tasks(user_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT id, time, day_of_week, task, week_parity, enabled FROM schedule WHERE user_id = ? ORDER BY day_of_week, time",
-                (user_id,)
-            ) as cursor:
-                return await cursor.fetchall()
+        return await db_manager.fetchall(
+            "SELECT id, time, day_of_week, task, week_parity, enabled FROM schedule WHERE user_id = ? ORDER BY day_of_week, time",
+            (user_id,)
+        )
 
     @staticmethod
     async def add_schedule_task(user_id: int, time: str, day: int, task: str):
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "INSERT INTO schedule (user_id, time, day_of_week, task) VALUES (?, ?, ?, ?)",
-                (user_id, time, day, task)
-            )
-            await db.commit()
-            return cursor.lastrowid
+        result = await db_manager.execute(
+            "INSERT INTO schedule (user_id, time, day_of_week, task) VALUES (?, ?, ?, ?) RETURNING id",
+            (user_id, time, day, task)
+        )
+        row = await result.fetchone()
+        await cache.delete(f"schedule_{user_id}")
+        return row[0] if row else None
 
     @staticmethod
     async def delete_schedule_task(task_id: int, user_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM schedule WHERE id = ? AND user_id = ?", (task_id, user_id))
-            await db.commit()
+        await db_manager.execute(
+            "DELETE FROM schedule WHERE id = ? AND user_id = ?", 
+            (task_id, user_id)
+        )
+        await cache.delete(f"schedule_{user_id}")
 
     @staticmethod
     async def update_schedule_week_parity(task_id: int, user_id: int, week_parity: str):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE schedule SET week_parity = ? WHERE id = ? AND user_id = ?", 
-                           (week_parity, task_id, user_id))
-            await db.commit()
+        await db_manager.execute(
+            "UPDATE schedule SET week_parity = ? WHERE id = ? AND user_id = ?", 
+            (week_parity, task_id, user_id)
+        )
+        await cache.delete(f"schedule_{user_id}")
 
     @staticmethod
     async def toggle_schedule_task(task_id: int, user_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE schedule SET enabled = NOT enabled WHERE id = ? AND user_id = ?", 
-                           (task_id, user_id))
-            await db.commit()
+        await db_manager.execute(
+            "UPDATE schedule SET enabled = NOT enabled WHERE id = ? AND user_id = ?", 
+            (task_id, user_id)
+        )
+        await cache.delete(f"schedule_{user_id}")
 
     @staticmethod
     async def check_schedule_access(user_id: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT start_date FROM schedule_access WHERE user_id = ? AND active = 1",
+        result = await db_manager.fetchone(
+            "SELECT start_date FROM schedule_access WHERE user_id = ? AND active = 1",
+            (user_id,)
+        )
+        
+        if not result:
+            await db_manager.execute(
+                "INSERT OR REPLACE INTO schedule_access (user_id, start_date, active) VALUES (?, date('now'), 1)",
                 (user_id,)
-            ) as cursor:
-                result = await cursor.fetchone()
-            
-            if not result:
-                await db.execute(
-                    "INSERT OR REPLACE INTO schedule_access (user_id, start_date, active) VALUES (?, date('now'), 1)",
-                    (user_id,)
-                )
-                await db.commit()
-                return True, 0, 0
-            
-            start_date = datetime.strptime(result[0], '%Y-%m-%d').date()
-            days_used = (datetime.now().date() - start_date).days
-            if days_used < 0:
-                days_used = 0
-            
-            if days_used <= 13:
-                return True, 0, days_used
-            else:
-                return True, 1, days_used
+            )
+            return True, 0, 0
+        
+        start_date = datetime.strptime(result[0], '%Y-%m-%d').date()
+        days_used = (datetime.now().date() - start_date).days
+        if days_used < 0:
+            days_used = 0
+        
+        if days_used <= 13:
+            return True, 0, days_used
+        else:
+            return True, 1, days_used
+
+    @staticmethod
+    async def get_today_schedule_users():
+        day_of_week = datetime.now().weekday()
+        week_parity = get_week_parity()
+        
+        return await db_manager.fetchall('''
+            SELECT DISTINCT user_id FROM schedule 
+            WHERE enabled = 1 AND day_of_week = ? 
+            AND (week_parity = 'все' OR week_parity = ?)
+        ''', (day_of_week, week_parity))
+
+    @staticmethod
+    async def cleanup_old_data():
+        """Очистка старых данных"""
+        await db_manager.execute('''
+            DELETE FROM chat_history 
+            WHERE timestamp < datetime('now', '-30 days')
+        ''')
+        
+        await db_manager.execute('''
+            UPDATE schedule_access 
+            SET active = 0 
+            WHERE user_id NOT IN (
+                SELECT DISTINCT user_id FROM schedule 
+                WHERE created_at > datetime('now', '-7 days')
+            )
+        ''')
 
 _main_keyboard = None
 
@@ -319,6 +509,36 @@ def get_week_parity_russian():
     week_number = datetime.now().isocalendar()[1]
     return "Чётная" if week_number % 2 == 0 else "Нечётная"
 
+def split_long_message(text, max_length=4000):
+    if len(text) <= max_length:
+        return [text]
+    
+    parts = []
+    while text:
+        if len(text) <= max_length:
+            parts.append(text)
+            break
+        
+        split_pos = text.rfind('\n', 0, max_length)
+        if split_pos == -1:
+            split_pos = text.rfind(' ', 0, max_length)
+        if split_pos == -1:
+            split_pos = max_length
+        
+        parts.append(text[:split_pos])
+        text = text[split_pos:].lstrip()
+    
+    return parts
+
+def file_size(size_bytes):
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+@timing_decorator
 async def generate_image(prompt: str):
     try:
         encoded_prompt = quote(prompt)
@@ -344,6 +564,7 @@ async def generate_image(prompt: str):
         logger.error(f"Image generation error: {e}")
         return None
 
+@timing_decorator
 async def ask_deepseek_simple(prompt: str, history=None):
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -394,6 +615,19 @@ async def ask_deepseek_simple(prompt: str, history=None):
         logger.error(f"DeepSeek error: {e}")
         return f"😔 Ошибка: {str(e)[:50]}"
 
+def sync_ocr(image_bytes):
+    """Синхронная функция для OCR"""
+    image = Image.open(io.BytesIO(image_bytes))
+    return pytesseract.image_to_string(image, lang='rus+eng')
+
+def sync_read_pdf(file_bytes):
+    """Синхронная функция для чтения PDF"""
+    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+    return text
+
 async def send_schedule_to_user(bot: Bot, user_id: int):
     try:
         today = datetime.now().strftime("%d.%m.%Y")
@@ -414,17 +648,13 @@ async def send_schedule_to_user(bot: Bot, user_id: int):
                 return
             await TokenBotDB.update_tokens(user_id, -1)
         
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT time, task, week_parity FROM schedule WHERE user_id = ? AND day_of_week = ? AND enabled = 1 ORDER BY time",
-                (user_id, day_of_week)
-            ) as cursor:
-                all_tasks = await cursor.fetchall()
+        tasks = await TokenBotDB.get_schedule_tasks(user_id)
         
         today_tasks = []
-        for task_time, task, task_week_parity in all_tasks:
-            if task_week_parity == "все" or task_week_parity == week_parity:
-                today_tasks.append((task_time, task))
+        for task_id, task_time, task_day, task, task_week_parity, enabled in tasks:
+            if task_day == day_of_week and enabled:
+                if task_week_parity == "все" or task_week_parity == week_parity:
+                    today_tasks.append((task_time, task))
         
         free_days_left = max(0, 14 - days_used) if days_used < 14 else 0
         
@@ -440,11 +670,13 @@ async def send_schedule_to_user(bot: Bot, user_id: int):
             
             schedule_text += "\n\nХорошего дня! 🔥"
             
-            await bot.send_message(
-                chat_id=user_id,
-                text=schedule_text,
-                reply_markup=get_main_keyboard()
-            )
+            parts = split_long_message(schedule_text)
+            for part in parts:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=part,
+                    reply_markup=get_main_keyboard()
+                )
             logger.info(f"Утреннее расписание отправлено пользователю {user_id}")
         
     except Exception as e:
@@ -453,39 +685,51 @@ async def send_schedule_to_user(bot: Bot, user_id: int):
 async def schedule_checker(bot: Bot):
     last_sent_date = None
     while True:
-        now = datetime.now()
-        if now.hour == 9 and now.minute == 0 and last_sent_date != now.date():
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute(
-                    "SELECT DISTINCT user_id FROM schedule WHERE enabled = 1"
-                ) as cursor:
-                    users = await cursor.fetchall()
+        try:
+            now = datetime.now()
+            if now.hour == 9 and now.minute == 0 and last_sent_date != now.date():
+                users = await TokenBotDB.get_today_schedule_users()
+                
+                for i in range(0, len(users), 10):
+                    batch = users[i:i+10]
+                    tasks = [send_schedule_to_user(bot, user[0]) for user in batch]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await asyncio.sleep(1) 
+                
+                last_sent_date = now.date()
             
-            for user in users:
-                user_id = user[0]
-                try:
-                    await send_schedule_to_user(bot, user_id)
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.error(f"Не удалось отправить расписание пользователю {user_id}: {e}")
-            
-            last_sent_date = now.date()
+            if now.hour == 3 and now.minute == 0:
+                await TokenBotDB.cleanup_old_data()
+                
+        except Exception as e:
+            logger.error(f"Schedule checker error: {e}")
+        
         await asyncio.sleep(60)
 
 class RateLimitMiddleware:
-    def __init__(self, rate_limit: int = 1):
+    def __init__(self, rate_limit: int = 1, burst_limit: int = 5):
         self.rate_limit = rate_limit
-        self.last_time = {}
-
+        self.burst_limit = burst_limit
+        self.users = {}
+    
     async def __call__(self, handler: Callable, event: types.Message, data: Dict[str, Any]) -> Any:
         user_id = event.from_user.id
-        current_time = time.time()
+        now = time.time()
         
-        if user_id in self.last_time and current_time - self.last_time[user_id] < self.rate_limit:
-            await event.answer("Подожди секунду!")
+        if user_id in self.users:
+            self.users[user_id] = [t for t in self.users[user_id] if now - t < 60]
+        else:
+            self.users[user_id] = []
+        
+        if len(self.users[user_id]) >= self.burst_limit:
+            await event.answer("⚠️ Слишком много запросов! Подожди минуту.")
             return
         
-        self.last_time[user_id] = current_time
+        if self.users[user_id] and now - self.users[user_id][-1] < self.rate_limit:
+            await event.answer("⏳ Подожди секунду между сообщениями!")
+            return
+        
+        self.users[user_id].append(now)
         return await handler(event, data)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -650,7 +894,7 @@ async def cmd_referral(message: types.Message):
 • Без ограничений!"""
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Поделиться", url=f"https://t.me/share/url?url=https://t.me/{bot_username}?start={user[4]}&text=Заходи в этого бота! Тут можно общаться с ИИ за токены")]
+        [InlineKeyboardButton(text="📱 Поделиться", url=f"https://t.me/share/url?url={referral_link}&text=Заходи в этого бота! Тут можно общаться с ИИ за токены")]
     ])
     
     await message.answer(text, reply_markup=keyboard)
@@ -701,17 +945,23 @@ async def handle_photo(message: types.Message):
         await message.answer("❌ Недостаточно токенов! Нужно 2 токена")
         return
     
+    file = await message.bot.get_file(message.photo[-1].file_id)
+    if file.file_size > 5 * 1024 * 1024:  # 5 MB
+        await message.answer("❌ Файл слишком большой (макс 5 МБ)")
+        return
+    
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     await message.answer("🔍 Распознаю текст с фото...")
     
     try:
-        file = await message.bot.get_file(message.photo[-1].file_id)
         file_bytes = await file.download_as_bytearray()
-        image = Image.open(io.BytesIO(file_bytes))
-        text = pytesseract.image_to_string(image, lang='rus+eng')
+        
+        text = await run_in_executor(sync_ocr, file_bytes)
         
         if text.strip():
-            await message.answer(f"📝 **Распознанный текст:**\n\n{text}")
+            parts = split_long_message(f"📝 **Распознанный текст:**\n\n{text}")
+            for part in parts:
+                await message.answer(part)
             await TokenBotDB.update_tokens(user_id, -2)
         else:
             await message.answer("😔 Не удалось распознать текст. Попробуй другое фото.")
@@ -743,6 +993,11 @@ async def handle_editable_document(message: types.Message, state: FSMContext):
         await message.answer("❌ Поддерживаются только TXT, DOCX и XLSX файлы")
         return
     
+    # Проверка размера файла
+    if file.file_size > 10 * 1024 * 1024:  # 10 MB
+        await message.answer("❌ Файл слишком большой (макс 10 МБ)")
+        return
+    
     user_id = message.from_user.id
     user = await TokenBotDB.get_user(user_id)
     if not user or user[3] < 1:
@@ -767,14 +1022,6 @@ async def handle_editable_document(message: types.Message, state: FSMContext):
         f"✅ Файл '{file_name}' загружен ({file_size(len(file_bytes))})",
         reply_markup=get_file_edit_keyboard()
     )
-
-def file_size(size_bytes):
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    else:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 @dp.callback_query(F.data == "edit_stats")
 async def edit_stats(callback: types.CallbackQuery, state: FSMContext):
@@ -803,7 +1050,7 @@ async def edit_stats(callback: types.CallbackQuery, state: FSMContext):
 📏 Символов: {chars}"""
         
     elif ext == 'docx':
-        doc = Document(io.BytesIO(content))
+        doc = await run_in_executor(Document, io.BytesIO(content))
         paragraphs = len(doc.paragraphs)
         text = '\n'.join([p.text for p in doc.paragraphs])
         words = len(text.split())
@@ -816,7 +1063,7 @@ async def edit_stats(callback: types.CallbackQuery, state: FSMContext):
 🔤 Слов: {words}"""
         
     elif ext == 'xlsx':
-        df = pd.read_excel(io.BytesIO(content))
+        df = await run_in_executor(pd.read_excel, io.BytesIO(content))
         rows, cols = df.shape
         
         stats = f"""📊 **Статистика Excel-файла**
@@ -828,7 +1075,9 @@ async def edit_stats(callback: types.CallbackQuery, state: FSMContext):
 📐 Столбцов: {cols}
 🔢 Ячеек: {rows * cols}"""
     
-    await callback.message.edit_text(stats)
+    parts = split_long_message(stats)
+    for part in parts:
+        await callback.message.edit_text(part)
     await callback.answer()
 
 @dp.callback_query(F.data == "edit_manual")
@@ -844,23 +1093,25 @@ async def edit_manual_start(callback: types.CallbackQuery, state: FSMContext):
     
     if ext == 'txt':
         content = file_info['content'].decode('utf-8', errors='ignore')
+        preview = content[:500] + "..." if len(content) > 500 else content
         await callback.message.edit_text(
-            f"📄 **Текущее содержимое:**\n\n{content[:500]}...\n\n"
+            f"📄 **Текущее содержимое:**\n\n{preview}\n\n"
             "✏️ Отправь новый текст для файла"
         )
         await state.set_state(EditStates.waiting_for_edit_text)
         
     elif ext == 'docx':
-        doc = Document(io.BytesIO(file_info['content']))
+        doc = await run_in_executor(Document, io.BytesIO(file_info['content']))
         text = '\n'.join([p.text for p in doc.paragraphs])
+        preview = text[:500] + "..." if len(text) > 500 else text
         await callback.message.edit_text(
-            f"📄 **Текст из документа:**\n\n{text[:500]}...\n\n"
+            f"📄 **Текст из документа:**\n\n{preview}\n\n"
             "✏️ Отправь новый текст для документа"
         )
         await state.set_state(EditStates.waiting_for_edit_text)
         
     elif ext == 'xlsx':
-        df = pd.read_excel(io.BytesIO(file_info['content']))
+        df = await run_in_executor(pd.read_excel, io.BytesIO(file_info['content']))
         await callback.message.edit_text(
             f"📊 **Excel-файл**\n\n"
             f"{df.head(10).to_string()}\n\n"
@@ -873,6 +1124,7 @@ async def edit_manual_start(callback: types.CallbackQuery, state: FSMContext):
 async def edit_manual_process(message: types.Message, state: FSMContext):
     data = await state.get_data()
     file_info = data.get('current_file')
+    append_mode = data.get('append_mode', False)
     
     if not file_info:
         await message.answer("❌ Файл не найден. Начни заново.")
@@ -883,17 +1135,30 @@ async def edit_manual_process(message: types.Message, state: FSMContext):
     new_content = message.text
     
     if ext == 'txt':
-        file_bytes = new_content.encode('utf-8')
+        if append_mode:
+            old_content = file_info['content'].decode('utf-8', errors='ignore')
+            file_bytes = (old_content + "\n" + new_content).encode('utf-8')
+        else:
+            file_bytes = new_content.encode('utf-8')
         new_filename = f"edited_{file_info['filename']}"
         
     elif ext == 'docx':
-        doc = Document()
-        for line in new_content.split('\n'):
-            doc.add_paragraph(line)
+        if append_mode:
+            doc = await run_in_executor(Document, io.BytesIO(file_info['content']))
+            doc.add_paragraph(new_content)
+        else:
+            doc = Document()
+            for line in new_content.split('\n'):
+                doc.add_paragraph(line)
+        
         file_bytes = io.BytesIO()
-        doc.save(file_bytes)
+        await run_in_executor(doc.save, file_bytes)
         file_bytes = file_bytes.getvalue()
         new_filename = f"edited_{file_info['filename']}"
+    else:
+        await message.answer("❌ Неподдерживаемый формат")
+        await state.clear()
+        return
     
     await message.answer_document(
         document=BufferedInputFile(file_bytes, filename=new_filename),
@@ -917,7 +1182,7 @@ async def edit_ai_start(callback: types.CallbackQuery, state: FSMContext):
     if ext == 'txt':
         content = file_info['content'].decode('utf-8', errors='ignore')
     elif ext == 'docx':
-        doc = Document(io.BytesIO(file_info['content']))
+        doc = await run_in_executor(Document, io.BytesIO(file_info['content']))
         content = '\n'.join([p.text for p in doc.paragraphs])
     else:
         await callback.message.edit_text("❌ AI-редактирование пока только для TXT и DOCX")
@@ -987,7 +1252,7 @@ async def edit_excel_cell_start(callback: types.CallbackQuery, state: FSMContext
         await callback.answer("Это не Excel-файл")
         return
     
-    df = pd.read_excel(io.BytesIO(file_info['content']))
+    df = await run_in_executor(pd.read_excel, io.BytesIO(file_info['content']))
     await state.update_data(excel_df=df)
     
     await callback.message.edit_text(
@@ -1022,7 +1287,7 @@ async def edit_excel_value_process(message: types.Message, state: FSMContext):
         df.iat[row-1, col-1] = value
         
         output = io.BytesIO()
-        df.to_excel(output, index=False)
+        await run_in_executor(df.to_excel, output, index=False)
         output.seek(0)
         
         await message.answer_document(
@@ -1045,11 +1310,11 @@ async def edit_excel_sort(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Это не Excel-файл")
         return
     
-    df = pd.read_excel(io.BytesIO(file_info['content']))
+    df = await run_in_executor(pd.read_excel, io.BytesIO(file_info['content']))
     df_sorted = df.sort_values(by=df.columns[0])
     
     output = io.BytesIO()
-    df_sorted.to_excel(output, index=False)
+    await run_in_executor(df_sorted.to_excel, output, index=False)
     output.seek(0)
     
     await callback.message.answer_document(
@@ -1068,13 +1333,14 @@ async def edit_word_replace_start(callback: types.CallbackQuery, state: FSMConte
         await callback.answer("Это не Word-файл")
         return
     
-    doc = Document(io.BytesIO(file_info['content']))
+    doc = await run_in_executor(Document, io.BytesIO(file_info['content']))
     text = '\n'.join([p.text for p in doc.paragraphs])
     
     await state.update_data(word_doc=doc, word_text=text)
+    preview = text[:500] + "..." if len(text) > 500 else text
     await callback.message.edit_text(
         "📝 **Word: замена текста**\n\n"
-        f"Текущий текст:\n{text[:500]}...\n\n"
+        f"Текущий текст:\n{preview}\n\n"
         "Введи что заменить и на что в формате: 'старое|новое'"
     )
     await state.set_state(EditStates.waiting_for_word_replace)
@@ -1091,7 +1357,7 @@ async def edit_word_replace_process(message: types.Message, state: FSMContext):
                 paragraph.text = paragraph.text.replace(old, new)
         
         output = io.BytesIO()
-        doc.save(output)
+        await run_in_executor(doc.save, output)
         output.seek(0)
         
         await message.answer_document(
@@ -1119,6 +1385,7 @@ async def edit_append(callback: types.CallbackQuery, state: FSMContext):
     )
     await state.set_state(EditStates.waiting_for_edit_text)
     await state.update_data(append_mode=True)
+    await callback.answer()
 
 @dp.message(F.text == "📚 Команды")
 @dp.message(Command("help"))
@@ -1160,9 +1427,10 @@ VIP канал: {VIP_CHANNEL_URL}
 @dp.message(F.text == "🧹 Очистить")
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM chat_history WHERE user_id = ?", (message.from_user.id,))
-        await db.commit()
+    await db_manager.execute(
+        "DELETE FROM chat_history WHERE user_id = ?", 
+        (message.from_user.id,)
+    )
     
     await message.answer("🧹 История диалога очищена!", reply_markup=get_main_keyboard())
 
@@ -1178,25 +1446,16 @@ async def cmd_schedule(message: types.Message, state: FSMContext):
     days = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
     today = days[datetime.now().weekday()]
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        day_of_week = datetime.now().weekday()
-        async with db.execute(
-            "SELECT time, task, week_parity FROM schedule WHERE user_id = ? AND day_of_week = ? AND enabled = 1 ORDER BY time",
-            (user_id, day_of_week)
-        ) as cursor:
-            today_tasks_raw = await cursor.fetchall()
-        
-        today_tasks = []
-        current_week_parity = get_week_parity()
-        for task_time, task, task_week_parity in today_tasks_raw:
+    all_tasks = await TokenBotDB.get_schedule_tasks(user_id)
+    
+    day_of_week = datetime.now().weekday()
+    current_week_parity = get_week_parity()
+    
+    today_tasks = []
+    for task_id, task_time, task_day, task, task_week_parity, enabled in all_tasks:
+        if task_day == day_of_week and enabled:
             if task_week_parity == "все" or task_week_parity == current_week_parity:
                 today_tasks.append((task_time, task))
-        
-        async with db.execute(
-            "SELECT id, time, day_of_week, task, week_parity, enabled FROM schedule WHERE user_id = ? ORDER BY day_of_week, time",
-            (user_id,)
-        ) as cursor:
-            all_tasks = await cursor.fetchall()
     
     free_days_left = max(0, 14 - days_used) if days_used < 14 else 0
     
@@ -1226,7 +1485,9 @@ async def cmd_schedule(message: types.Message, state: FSMContext):
     else:
         text += "   У тебя пока нет задач\n"
     
-    await message.answer(text, reply_markup=get_schedule_keyboard())
+    parts = split_long_message(text)
+    for part in parts:
+        await message.answer(part, reply_markup=get_schedule_keyboard() if part == parts[0] else None)
 
 @dp.callback_query(F.data == "schedule_add")
 async def schedule_add_start(callback: types.CallbackQuery, state: FSMContext):
@@ -1468,17 +1729,20 @@ async def cmd_admin(message: types.Message):
         await message.answer("Только для админа!")
         return
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-            users = (await cursor.fetchone())[0]
-        async with db.execute("SELECT SUM(tokens) FROM users") as cursor:
-            tokens = (await cursor.fetchone())[0] or 0
-        async with db.execute("SELECT COUNT(*) FROM schedule") as cursor:
-            schedule_count = (await cursor.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM payments WHERE status='pending'") as cursor:
-            pending_payments = (await cursor.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned=1") as cursor:
-            banned_users = (await cursor.fetchone())[0]
+    users_count = await db_manager.fetchone("SELECT COUNT(*) FROM users")
+    users = users_count[0] if users_count else 0
+    
+    tokens_sum = await db_manager.fetchone("SELECT SUM(tokens) FROM users")
+    tokens = tokens_sum[0] or 0 if tokens_sum else 0
+    
+    schedule_count_res = await db_manager.fetchone("SELECT COUNT(*) FROM schedule")
+    schedule_count = schedule_count_res[0] if schedule_count_res else 0
+    
+    pending_payments_res = await db_manager.fetchone("SELECT COUNT(*) FROM payments WHERE status='pending'")
+    pending_payments = pending_payments_res[0] if pending_payments_res else 0
+    
+    banned_users_res = await db_manager.fetchone("SELECT COUNT(*) FROM users WHERE is_banned=1")
+    banned_users = banned_users_res[0] if banned_users_res else 0
     
     text = f"""📊 АДМИН ПАНЕЛЬ
 
@@ -1492,11 +1756,24 @@ async def cmd_admin(message: types.Message):
     
     await message.answer(text)
 
+async def shutdown():
+    """Graceful shutdown"""
+    logger.info("Shutting down...")
+    await db_manager.close()
+    executor.shutdown(wait=True)
+    await cache.clear()
+
 async def main():
-    await TokenBotDB.init_db()
-    asyncio.create_task(schedule_checker(bot))
-    logger.info("Бот запущен с OCR и редактированием файлов!")
-    await dp.start_polling(bot)
+    try:
+        await TokenBotDB.init_db()
+        await cache.start_cleanup()
+        
+        asyncio.create_task(schedule_checker(bot))
+        
+        logger.info("Бот запущен с оптимизированной БД!")
+        await dp.start_polling(bot)
+    finally:
+        await shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
