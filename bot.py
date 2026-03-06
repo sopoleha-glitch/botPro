@@ -30,8 +30,22 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import StateFilter
 from functools import lru_cache, wraps
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import os
+import tempfile
+
+if os.path.exists('/usr/bin/tesseract'):
+    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+elif os.path.exists('/usr/local/bin/tesseract'):
+    pytesseract.pytesseract.tesseract_cmd = '/usr/local/bin/tesseract'
+
+try:
+    PERSISTENT_DIR = '/home/user/data'
+    if not os.path.exists(PERSISTENT_DIR):
+        os.makedirs(PERSISTENT_DIR, exist_ok=True)
+    DB_PATH = os.path.join(PERSISTENT_DIR, 'tokenbot.db')
+except:
+    DB_PATH = os.path.join(tempfile.gettempdir(), 'tokenbot.db')
 
 BOT_TOKEN = "8667653728:AAF3Ekms8refE2-BvS1tgDl03sVuLpvvpx0"
 ADMIN_ID = 745613614
@@ -44,7 +58,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = 'tokenbot.db'
+logger.info(f"Database path: {DB_PATH}")
+
 executor = ThreadPoolExecutor(max_workers=4)
 
 class DatabaseManager:
@@ -112,7 +127,7 @@ class CacheManager:
     async def start_cleanup(self):
         async def cleanup():
             while True:
-                await asyncio.sleep(300) 
+                await asyncio.sleep(300)
                 now = time.time()
                 self.cache = {k: v for k, v in self.cache.items() 
                             if now - v[1] < self.ttl}
@@ -312,7 +327,6 @@ class TokenBotDB:
                     (tokens, abs(tokens), user_id)
                 )
         
-        # Инвалидируем кэш
         await cache.delete(f"user_{user_id}")
 
     @staticmethod
@@ -441,7 +455,6 @@ class TokenBotDB:
 
     @staticmethod
     async def cleanup_old_data():
-        """Очистка старых данных"""
         await db_manager.execute('''
             DELETE FROM chat_history 
             WHERE timestamp < datetime('now', '-30 days')
@@ -615,12 +628,10 @@ async def ask_deepseek_simple(prompt: str, history=None):
         return f"😔 Ошибка: {str(e)[:50]}"
 
 def sync_ocr(image_bytes):
-    """Синхронная функция для OCR"""
     image = Image.open(io.BytesIO(image_bytes))
     return pytesseract.image_to_string(image, lang='rus+eng')
 
 def sync_read_pdf(file_bytes):
-    """Синхронная функция для чтения PDF"""
     pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
     text = ""
     for page in pdf_reader.pages:
@@ -693,7 +704,7 @@ async def schedule_checker(bot: Bot):
                     batch = users[i:i+10]
                     tasks = [send_schedule_to_user(bot, user[0]) for user in batch]
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    await asyncio.sleep(1) 
+                    await asyncio.sleep(1)
                 
                 last_sent_date = now.date()
             
@@ -944,8 +955,10 @@ async def handle_photo(message: types.Message):
         await message.answer("❌ Недостаточно токенов! Нужно 2 токена")
         return
     
-    file = await message.bot.get_file(message.photo[-1].file_id)
-    if file.file_size > 5 * 1024 * 1024:  # 5 MB
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    
+    if file.file_size > 5 * 1024 * 1024:
         await message.answer("❌ Файл слишком большой (макс 5 МБ)")
         return
     
@@ -953,11 +966,12 @@ async def handle_photo(message: types.Message):
     await message.answer("🔍 Распознаю текст с фото...")
     
     try:
-        file_bytes = await file.download_as_bytearray()
+        file_bytes = await message.bot.download_file(file.file_path)
+        file_bytes = file_bytes.read()
         
         text = await run_in_executor(sync_ocr, file_bytes)
         
-        if text.strip():
+        if text and text.strip():
             parts = split_long_message(f"📝 **Распознанный текст:**\n\n{text}")
             for part in parts:
                 await message.answer(part)
@@ -967,7 +981,7 @@ async def handle_photo(message: types.Message):
             
     except Exception as e:
         logger.error(f"OCR error: {e}")
-        await message.answer("😔 Ошибка при распознавании текста")
+        await message.answer(f"😔 Ошибка при распознавании текста: {str(e)[:100]}")
 
 @dp.message(F.text == "📄 Редактор файлов")
 async def editor_button(message: types.Message):
@@ -992,8 +1006,7 @@ async def handle_editable_document(message: types.Message, state: FSMContext):
         await message.answer("❌ Поддерживаются только TXT, DOCX и XLSX файлы")
         return
     
-    # Проверка размера файла
-    if file.file_size > 10 * 1024 * 1024:  # 10 MB
+    if file.file_size > 10 * 1024 * 1024:
         await message.answer("❌ Файл слишком большой (макс 10 МБ)")
         return
     
@@ -1006,7 +1019,8 @@ async def handle_editable_document(message: types.Message, state: FSMContext):
     await message.answer("📥 Скачиваю файл...")
     
     file_obj = await message.bot.get_file(file.file_id)
-    file_bytes = await file_obj.download_as_bytearray()
+    file_bytes = await message.bot.download_file(file_obj.file_path)
+    file_bytes = file_bytes.read()
     
     file_info = {
         'filename': file_name,
@@ -1756,7 +1770,6 @@ async def cmd_admin(message: types.Message):
     await message.answer(text)
 
 async def shutdown():
-    """Graceful shutdown"""
     logger.info("Shutting down...")
     await db_manager.close()
     executor.shutdown(wait=True)
