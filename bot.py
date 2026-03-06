@@ -60,7 +60,6 @@ class DatabaseManager:
     async def get_connection(self):
         if self._connection is None:
             self._connection = await aiosqlite.connect(DB_PATH)
-            # Оптимизация SQLite
             await self._connection.execute("PRAGMA journal_mode=WAL")
             await self._connection.execute("PRAGMA synchronous=NORMAL")
             await self._connection.execute("PRAGMA cache_size=10000")
