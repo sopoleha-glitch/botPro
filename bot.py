@@ -48,7 +48,7 @@ try:
 except:
     DB_PATH = os.path.join(tempfile.gettempdir(), 'tokenbot.db')
 
-BOT_TOKEN = "8667653728:AAF3Ekms8refE2-BvS1tgDl03sVuLpvvpx0"
+BOT_TOKEN = "8354278634:AAGmwyRzXkbVgu7PzBG3Fi-AW8OMIzXKo6U"
 ADMIN_ID = 745613614
 DEEPSEEK_API_KEY = "sk-a45c0fa810f4430e8a154955c153070d"
 VIP_CHANNEL_URL = "https://t.me/squad_vpotoke"
