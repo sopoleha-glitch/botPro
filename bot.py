@@ -168,34 +168,54 @@ async def run_in_executor(func, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, func, *args)
 
-async def ocr_with_api(image_bytes):
+async def analyze_image_with_deepseek(image_bytes, prompt="Что изображено на фото? Опиши подробно."):
     try:
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
         
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "deepseek-chat",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1000
+        }
+        
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.ocr.space/parse/image",
-                data={
-                    "base64Image": f"data:image/jpeg;base64,{image_base64}",
-                    "language": "rus",
-                    "OCREngine": "2",
-                    "isOverlayRequired": "false"
-                },
-                headers={"apikey": "helloworld"},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
-                    if result.get("ParsedResults"):
-                        text = result["ParsedResults"][0]["ParsedText"]
-                        return text.strip()
-                    else:
-                        logger.error(f"OCR API error: {result.get('ErrorMessage')}")
+                "https://api.deepseek.com/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result.get("choices", [{}])[0].get("message", {}).get("content", "😔 Нет ответа")
                 else:
-                    logger.error(f"OCR API HTTP error: {resp.status}")
+                    error_text = await response.text()
+                    logger.error(f"DeepSeek Vision error: {response.status} - {error_text}")
+                    return f"😔 Ошибка API: {response.status}"
     except Exception as e:
-        logger.error(f"OCR API exception: {e}")
-    return None
+        logger.error(f"Vision analysis error: {e}")
+        return f"😔 Ошибка: {str(e)}"
 
 class ScheduleStates(StatesGroup):
     waiting_for_day = State()
@@ -203,7 +223,7 @@ class ScheduleStates(StatesGroup):
     waiting_for_week_parity = State()
 
 class ImageStates(StatesGroup):
-    waiting_for_prompt = State()
+    waiting_for_question = State()
 
 class EditStates(StatesGroup):
     waiting_for_edit_text = State()
@@ -508,9 +528,8 @@ def get_main_keyboard():
             keyboard=[
                 [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="💳 Купить")],
                 [KeyboardButton(text="👥 Рефералы"), KeyboardButton(text="📅 Расписание")],
-                [KeyboardButton(text="🎨 Нарисовать"), KeyboardButton(text="📸 OCR фото")],
-                [KeyboardButton(text="📄 Редактор файлов"), KeyboardButton(text="📚 Команды")],
-                [KeyboardButton(text="🧹 Очистить")]
+                [KeyboardButton(text="📸 Анализ фото"), KeyboardButton(text="📄 Редактор файлов")],
+                [KeyboardButton(text="📚 Команды"), KeyboardButton(text="🧹 Очистить")]
             ],
             resize_keyboard=True
         )
@@ -541,6 +560,14 @@ def get_file_edit_keyboard():
         [InlineKeyboardButton(text="📈 Excel: изменить ячейку", callback_data="edit_excel_cell")],
         [InlineKeyboardButton(text="📊 Excel: сортировка", callback_data="edit_excel_sort")],
         [InlineKeyboardButton(text="📝 Word: замена текста", callback_data="edit_word_replace")]
+    ])
+
+def get_vision_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Что на фото?", callback_data="vision_what")],
+        [InlineKeyboardButton(text="📝 Описать детально", callback_data="vision_detailed")],
+        [InlineKeyboardButton(text="🔢 Распознать текст", callback_data="vision_text")],
+        [InlineKeyboardButton(text="❓ Свой вопрос", callback_data="vision_custom")]
     ])
 
 def get_week_parity():
@@ -579,32 +606,6 @@ def file_size(size_bytes):
         return f"{size_bytes / 1024:.1f} KB"
     else:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
-
-@timing_decorator
-async def generate_image(prompt: str):
-    try:
-        encoded_prompt = quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-        params = {
-            "width": 1024,
-            "height": 1024,
-            "model": "flux",
-            "nologo": "true"
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                else:
-                    logger.error(f"Pollinations error: {resp.status}")
-                    return None
-    except asyncio.TimeoutError:
-        logger.error("Timeout generating image")
-        return None
-    except Exception as e:
-        logger.error(f"Image generation error: {e}")
-        return None
 
 @timing_decorator
 async def ask_deepseek_simple(prompt: str, history=None):
@@ -794,17 +795,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
 📊 Всего заработано: {user[6]} токенов
 💬 Я помню последние 100 сообщений
 📁 Могу читать файлы (PDF, Word, TXT, Excel)
-📸 Распознаю текст с фото (OCR)
+📸 Анализирую фото как ChatGPT Vision (3 токена)
 ✏️ Редактирую файлы (TXT, DOCX, XLSX)
 📅 Можешь создать своё личное расписание
-🎨 Генерирую картинки (2 токена)
 
 VIP канал: {VIP_CHANNEL_URL}
 
 Как это работает:
 • 1 сообщение = 1 токен
-• 1 картинка = 2 токена
-• OCR фото = 2 токена
+• Анализ фото = 3 токена
 • Редактирование = 1-2 токена
 • Загружай файлы - я прочитаю и отвечу
 • Приводи друзей (+5 токенов)
@@ -822,16 +821,14 @@ VIP канал: {VIP_CHANNEL_URL}
 🔗 Твой реферальный код: {ref_code}
 💬 Я помню последние 100 сообщений
 📁 Могу читать файлы (PDF, Word, TXT, Excel)
-📸 Распознаю текст с фото (OCR)
+📸 Анализирую фото как ChatGPT Vision (3 токена)
 ✏️ Редактирую файлы (TXT, DOCX, XLSX)
 📅 Можешь создать своё личное расписание
-🎨 Генерирую картинки (2 токена)
 
 Как это работает:
 • 10 токенов уже на твоем счету
 • 1 сообщение = 1 токен
-• 1 картинка = 2 токена
-• OCR фото = 2 токена
+• Анализ фото = 3 токена
 • Редактирование = 1-2 токена
 • Загружай файлы - я прочитаю и отвечу
 • Приводи друзей (+5 токенов)
@@ -928,79 +925,94 @@ async def cmd_referral(message: types.Message):
     
     await message.answer(text, reply_markup=keyboard)
 
-@dp.message(F.text == "🎨 Нарисовать")
-@dp.message(Command("draw"))
-async def cmd_draw(message: types.Message, state: FSMContext):
-    await message.answer("🎨 Отправь описание картинки, например:\nкот в космосе\n\nСтоимость: 2 токена")
-    await state.set_state(ImageStates.waiting_for_prompt)
-
-@dp.message(ImageStates.waiting_for_prompt)
-async def process_image_prompt(message: types.Message, state: FSMContext):
-    prompt = message.text
-    
-    user = await TokenBotDB.get_user(message.from_user.id)
-    if not user or user[3] < 2:
-        await message.answer("❌ Недостаточно токенов! Нужно 2 токена")
-        await state.clear()
-        return
-    
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
-    await message.answer("🎨 Генерирую картинку... (до 30 секунд)")
-    
-    image_bytes = await generate_image(prompt)
-    
-    if image_bytes:
-        await message.answer_photo(
-            photo=BufferedInputFile(image_bytes, filename="image.jpg"),
-            caption=f"🎨 {prompt}"
-        )
-        await TokenBotDB.update_tokens(message.from_user.id, -2)
-        logger.info(f"User {message.from_user.id} generated image: {prompt[:50]}")
-    else:
-        await message.answer("😔 Не удалось сгенерировать картинку. Попробуй другой запрос.")
-    
-    await state.clear()
-
-@dp.message(F.text == "📸 OCR фото")
-async def ocr_button(message: types.Message):
-    await message.answer("📸 Отправь фото с текстом, я распознаю его (стоимость: 2 токена)")
+@dp.message(F.text == "📸 Анализ фото")
+async def vision_button(message: types.Message):
+    await message.answer("📸 Отправь фото, и я проанализирую его как ChatGPT Vision (стоимость: 3 токена)")
 
 @dp.message(F.photo)
-async def handle_photo(message: types.Message):
+async def handle_photo_vision(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     user = await TokenBotDB.get_user(user_id)
     
-    if not user or user[3] < 2:
-        await message.answer("❌ Недостаточно токенов! Нужно 2 токена")
+    if not user or user[3] < 3:
+        await message.answer("❌ Недостаточно токенов! Нужно 3 токена для анализа фото")
         return
     
     photo = message.photo[-1]
     file = await message.bot.get_file(photo.file_id)
     
-    if file.file_size > 5 * 1024 * 1024:
-        await message.answer("❌ Файл слишком большой (макс 5 МБ)")
+    if file.file_size > 10 * 1024 * 1024:
+        await message.answer("❌ Файл слишком большой (макс 10 МБ)")
         return
     
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    await message.answer("🔍 Распознаю текст через API...")
     
-    try:
-        file_bytes = await message.bot.download_file(file.file_path)
-        file_bytes = file_bytes.read()
-        
-        text = await ocr_with_api(file_bytes)
-        
-        if text and text.strip():
-            parts = split_long_message(f"📝 **Распознанный текст:**\n\n{text}")
-            for part in parts:
-                await message.answer(part)
-            await TokenBotDB.update_tokens(user_id, -2)
-        else:
-            await message.answer("😔 Не удалось распознать текст. Попробуй другое фото.")
-            
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        await message.answer(f"😔 Ошибка при распознавании текста")
+    file_bytes = await message.bot.download_file(file.file_path)
+    file_bytes = file_bytes.read()
+    
+    await state.update_data(photo_bytes=file_bytes)
+    
+    await message.answer("📸 Что ты хочешь узнать о фото?", reply_markup=get_vision_keyboard())
+
+@dp.callback_query(F.data.startswith("vision_"))
+async def process_vision_choice(callback: types.CallbackQuery, state: FSMContext):
+    choice = callback.data
+    data = await state.get_data()
+    photo_bytes = data.get('photo_bytes')
+    
+    if not photo_bytes:
+        await callback.answer("Фото не найдено, отправь заново")
+        await state.clear()
+        return
+    
+    prompts = {
+        "vision_what": "Что изображено на этом фото? Ответь кратко, 2-3 предложения.",
+        "vision_detailed": "Опиши это фото максимально подробно. Что ты видишь? Какие детали, цвета, объекты?",
+        "vision_text": "Прочитай весь текст на этом фото и выведи его.",
+        "vision_custom": ""
+    }
+    
+    if choice == "vision_custom":
+        await callback.message.edit_text("✏️ Напиши свой вопрос о фото:")
+        await state.set_state(ImageStates.waiting_for_question)
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text("🤔 Анализирую фото...")
+    
+    prompt = prompts.get(choice, prompts["vision_what"])
+    analysis = await analyze_image_with_deepseek(photo_bytes, prompt)
+    
+    await TokenBotDB.update_tokens(callback.from_user.id, -3)
+    
+    parts = split_long_message(f"📸 **Анализ фото:**\n\n{analysis}")
+    for part in parts:
+        await callback.message.answer(part)
+    
+    await state.clear()
+    await callback.answer()
+
+@dp.message(ImageStates.waiting_for_question)
+async def process_custom_question(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    photo_bytes = data.get('photo_bytes')
+    question = message.text
+    
+    if not photo_bytes:
+        await message.answer("❌ Фото не найдено. Отправь фото заново.")
+        await state.clear()
+        return
+    
+    await message.answer("🤔 Анализирую фото...")
+    
+    analysis = await analyze_image_with_deepseek(photo_bytes, question)
+    await TokenBotDB.update_tokens(message.from_user.id, -3)
+    
+    parts = split_long_message(f"📸 **Ответ:**\n\n{analysis}")
+    for part in parts:
+        await message.answer(part)
+    
+    await state.clear()
 
 @dp.message(F.text == "📄 Редактор файлов")
 async def editor_button(message: types.Message):
@@ -1432,11 +1444,8 @@ async def cmd_help(message: types.Message):
 💰 Покупка токенов:
 /buy - Открыть магазин токенов
 
-🎨 Генерация картинок:
-/draw - Нарисовать картинку (2 токена)
-
-📸 Распознавание текста:
-(просто отправь фото с текстом) - 2 токена
+📸 Анализ фото:
+(отправь фото) - 3 токена
 
 📄 Редактирование файлов:
 (отправь TXT, DOCX или XLSX файл)
@@ -1449,6 +1458,9 @@ async def cmd_help(message: types.Message):
 
 👥 Реферальная система:
 /referral - Твоя реферальная ссылка
+
+🎁 Админ команды:
+/add_tokens [user_id] [количество] - начислить токены
 
 VIP канал: {VIP_CHANNEL_URL}
 
@@ -1465,6 +1477,47 @@ async def cmd_clear(message: types.Message):
     )
     
     await message.answer("🧹 История диалога очищена!", reply_markup=get_main_keyboard())
+
+@dp.message(Command("add_tokens"))
+async def cmd_add_tokens(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Только для админа!")
+        return
+    
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("❌ Используй: /add_tokens [user_id] [количество]")
+        return
+    
+    try:
+        target_user_id = int(args[1])
+        amount = int(args[2])
+        
+        user = await TokenBotDB.get_user(target_user_id)
+        if not user:
+            await message.answer("❌ Пользователь не найден")
+            return
+        
+        await TokenBotDB.update_tokens(target_user_id, amount)
+        
+        await message.answer(f"✅ Добавлено {amount} токенов пользователю {target_user_id}")
+        
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"🎁 Вам начислено {amount} токенов!"
+            )
+        except:
+            pass
+            
+    except ValueError:
+        await message.answer("❌ Неверный формат чисел")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: types.Message):
+    await message.answer(f"🆔 Твой ID: {message.from_user.id}")
 
 @dp.message(F.text == "📅 Расписание")
 @dp.message(Command("schedule"))
@@ -1801,7 +1854,7 @@ async def main():
         
         asyncio.create_task(schedule_checker(bot))
         
-        logger.info("Бот запущен с оптимизированной БД и OCR API!")
+        logger.info("Бот запущен с DeepSeek Vision!")
         await dp.start_polling(bot)
     finally:
         await shutdown()
