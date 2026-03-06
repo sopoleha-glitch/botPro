@@ -1,3 +1,4 @@
+```python
 import asyncio
 import logging
 import json
@@ -33,6 +34,7 @@ from functools import lru_cache, wraps
 from concurrent.futures import ThreadPoolExecutor
 import os
 import tempfile
+import base64
 
 if os.path.exists('/usr/bin/tesseract'):
     pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
@@ -166,6 +168,35 @@ def timing_decorator(func):
 async def run_in_executor(func, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, func, *args)
+
+async def ocr_with_api(image_bytes):
+    try:
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.ocr.space/parse/image",
+                data={
+                    "base64Image": f"data:image/jpeg;base64,{image_base64}",
+                    "language": "rus",
+                    "OCREngine": "2",
+                    "isOverlayRequired": "false"
+                },
+                headers={"apikey": "helloworld"},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    if result.get("ParsedResults"):
+                        text = result["ParsedResults"][0]["ParsedText"]
+                        return text.strip()
+                    else:
+                        logger.error(f"OCR API error: {result.get('ErrorMessage')}")
+                else:
+                    logger.error(f"OCR API HTTP error: {resp.status}")
+    except Exception as e:
+        logger.error(f"OCR API exception: {e}")
+    return None
 
 class ScheduleStates(StatesGroup):
     waiting_for_day = State()
@@ -627,17 +658,6 @@ async def ask_deepseek_simple(prompt: str, history=None):
         logger.error(f"DeepSeek error: {e}")
         return f"😔 Ошибка: {str(e)[:50]}"
 
-def sync_ocr(image_bytes):
-    image = Image.open(io.BytesIO(image_bytes))
-    return pytesseract.image_to_string(image, lang='rus+eng')
-
-def sync_read_pdf(file_bytes):
-    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
-
 async def send_schedule_to_user(bot: Bot, user_id: int):
     try:
         today = datetime.now().strftime("%d.%m.%Y")
@@ -963,13 +983,13 @@ async def handle_photo(message: types.Message):
         return
     
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    await message.answer("🔍 Распознаю текст с фото...")
+    await message.answer("🔍 Распознаю текст через API...")
     
     try:
         file_bytes = await message.bot.download_file(file.file_path)
         file_bytes = file_bytes.read()
         
-        text = await run_in_executor(sync_ocr, file_bytes)
+        text = await ocr_with_api(file_bytes)
         
         if text and text.strip():
             parts = split_long_message(f"📝 **Распознанный текст:**\n\n{text}")
@@ -981,7 +1001,7 @@ async def handle_photo(message: types.Message):
             
     except Exception as e:
         logger.error(f"OCR error: {e}")
-        await message.answer(f"😔 Ошибка при распознавании текста: {str(e)[:100]}")
+        await message.answer(f"😔 Ошибка при распознавании текста")
 
 @dp.message(F.text == "📄 Редактор файлов")
 async def editor_button(message: types.Message):
@@ -1782,10 +1802,11 @@ async def main():
         
         asyncio.create_task(schedule_checker(bot))
         
-        logger.info("Бот запущен с оптимизированной БД!")
+        logger.info("Бот запущен с оптимизированной БД и OCR API!")
         await dp.start_polling(bot)
     finally:
         await shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
